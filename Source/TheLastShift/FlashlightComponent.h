@@ -119,6 +119,9 @@ private:
 	/** Lazily binds Enhanced Input once the owning Pawn has a valid PlayerController input component. */
 	void TryBindInput();
 
+	/** Silences leftover prototype flashlight components on the owner so only this one renders. */
+	void DisableLegacyFlashlightComponents();
+
 	/**
 	 * Finds the hand mesh (explicit HandMeshComponent, or a sibling skeletal mesh
 	 * component on the same actor that has HandSocketName) and attaches to it.

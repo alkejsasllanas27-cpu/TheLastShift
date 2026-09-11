@@ -59,6 +59,8 @@ void UFlashlightComponent::BeginPlay()
 
 	TryAttachToHand(/*bRequireTargetRegistered=*/false);
 
+	DisableLegacyFlashlightComponents();
+
 	bIsOn = bStartsOn;
 	SpotLight->SetVisibility(bIsOn);
 	FlashlightMesh->SetVisibility(bIsOn);
@@ -66,6 +68,49 @@ void UFlashlightComponent::BeginPlay()
 	TryBindInput();
 	// NOTE: tick is intentionally left enabled (see TickComponent) -- it also
 	// keeps the hand attachment self-healing for the lifetime of the component.
+}
+
+void UFlashlightComponent::DisableLegacyFlashlightComponents()
+{
+	AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return;
+	}
+
+	// An earlier prototype left a hand-placed flashlight mesh and spot light on the
+	// Blueprint. They cannot be deleted (the Blueprint graph still references them,
+	// and removing them fails to compile), and clearing them from the editor does not
+	// survive into play. So they are silenced here, on the live instance, every time
+	// play begins -- otherwise the player sees two extra flashlights floating in view.
+	TArray<UStaticMeshComponent*> StaticMeshes;
+	Owner->GetComponents<UStaticMeshComponent>(StaticMeshes);
+	for (UStaticMeshComponent* Mesh : StaticMeshes)
+	{
+		if (Mesh && Mesh != FlashlightMesh)
+		{
+			Mesh->SetStaticMesh(nullptr);
+			Mesh->SetVisibility(false);
+			Mesh->SetHiddenInGame(true);
+			Mesh->SetCastShadow(false);
+		}
+	}
+
+	TArray<USpotLightComponent*> SpotLights;
+	Owner->GetComponents<USpotLightComponent>(SpotLights);
+	for (USpotLightComponent* Light : SpotLights)
+	{
+		if (Light && Light != SpotLight)
+		{
+			Light->SetIntensity(0.f);
+			Light->SetVisibility(false);
+			Light->SetHiddenInGame(true);
+			Light->SetCastShadows(false);
+			Light->SetAttenuationRadius(0.f);
+			Light->bAffectsWorld = false;
+			Light->MarkRenderStateDirty();
+		}
+	}
 }
 
 void UFlashlightComponent::TryAttachToHand(bool bRequireTargetRegistered)
@@ -135,10 +180,12 @@ void UFlashlightComponent::TryAttachToHand(bool bRequireTargetRegistered)
 		return;
 	}
 
-	// Only the parent/socket RELATIONSHIP is established here; the actual transform
-	// is fully recomputed every tick in TickComponent (see UpdateAimedTransform),
-	// because this rig's hand socket only turns with yaw, not pitch -- relying on
-	// its rotation would mean the beam ignores looking up/down entirely.
+	// Only the parent/socket RELATIONSHIP is established here. The transform itself is
+	// recomputed every tick from GetSocketLocation/Rotation (see UpdateAimedTransform)
+	// rather than left to rigid attachment, because the holding pose is written into
+	// the mesh's component-space bones AFTER animation: socket queries observe that
+	// override, but a rigidly attached child does not, and would visibly lag behind
+	// the posed arm.
 	AttachToComponent(ResolvedHandMesh, FAttachmentTransformRules::KeepWorldTransform, HandSocketName);
 
 	if (BoundArmMesh != ResolvedHandMesh)
@@ -166,8 +213,10 @@ void UFlashlightComponent::OnArmBoneTransformsFinalized()
 	}
 	USkeletalMeshComponent* Mesh = BoundArmMesh.Get();
 
-	static const FName PivotBone("upperarm_r");
-	static const TArray<FName> ChainBones = {
+	// Two naming conventions are supported: Epic's mannequin rig (upperarm_r / hand_r)
+	// and the Mixamo rig (RightArm / RightHand), so a downloaded character can be
+	// dropped in without the holding pose silently doing nothing.
+	static const TArray<FName> EpicChain = {
 		"upperarm_r", "upperarm_twist_01_r", "upperarm_twist_02_r",
 		"lowerarm_r", "lowerarm_twist_01_r", "lowerarm_twist_02_r", "hand_r",
 		"index_metacarpal_r", "index_01_r", "index_02_r", "index_03_r",
@@ -176,12 +225,29 @@ void UFlashlightComponent::OnArmBoneTransformsFinalized()
 		"pinky_metacarpal_r", "pinky_01_r", "pinky_02_r", "pinky_03_r",
 		"thumb_01_r", "thumb_02_r", "thumb_03_r"
 	};
+	static const TArray<FName> MixamoChain = {
+		"RightArm", "RightForeArm", "RightHand",
+		"RightHandThumb1", "RightHandThumb2", "RightHandThumb3", "RightHandThumb4",
+		"RightHandIndex1", "RightHandIndex2", "RightHandIndex3", "RightHandIndex4",
+		"RightHandMiddle1", "RightHandMiddle2", "RightHandMiddle3", "RightHandMiddle4",
+		"RightHandRing1", "RightHandRing2", "RightHandRing3", "RightHandRing4",
+		"RightHandPinky1", "RightHandPinky2", "RightHandPinky3", "RightHandPinky4"
+	};
 
-	const int32 PivotIndex = Mesh->GetBoneIndex(PivotBone);
+	FName PivotBone("upperarm_r");
+	const TArray<FName>* Chain = &EpicChain;
+	int32 PivotIndex = Mesh->GetBoneIndex(PivotBone);
+	if (PivotIndex == INDEX_NONE)
+	{
+		PivotBone = FName("RightArm");
+		PivotIndex = Mesh->GetBoneIndex(PivotBone);
+		Chain = &MixamoChain;
+	}
 	if (PivotIndex == INDEX_NONE)
 	{
 		return;
 	}
+	const TArray<FName>& ChainBones = *Chain;
 
 	TArray<FTransform>& ComponentSpaceTransforms = Mesh->GetEditableComponentSpaceTransforms();
 	const FVector PivotLocation = ComponentSpaceTransforms[PivotIndex].GetLocation();
@@ -234,9 +300,8 @@ void UFlashlightComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 
 void UFlashlightComponent::UpdateAimedTransform()
 {
-	USkeletalMeshComponent* HandMesh = Cast<USkeletalMeshComponent>(GetAttachParent());
 	APawn* Pawn = Cast<APawn>(GetOwner());
-	if (!HandMesh || !Pawn)
+	if (!Pawn)
 	{
 		return;
 	}
@@ -247,22 +312,30 @@ void UFlashlightComponent::UpdateAimedTransform()
 		return;
 	}
 
-	// Position: follows the hand socket's actual (animated) location every frame,
-	// so it visually moves and sways with the hand during walking/idling.
-	// Rotation: driven directly from the camera, NOT the socket -- this rig's hand
-	// bone only turns with yaw (confirmed by measurement), so using its rotation
-	// would mean the beam never responds to looking up/down. Driving rotation from
-	// the camera guarantees the beam always points exactly where the player aims.
-	const FVector HandLocation = HandMesh->GetSocketLocation(HandSocketName);
-	const FQuat AimRotation = GripOffsetRotation.Quaternion() * Camera->GetComponentQuat();
-
-	FVector FinalLocation = HandLocation + AimRotation.RotateVector(GripOffsetLocation);
-	if (!FMath::IsNearlyZero(GripDepthOffset))
+	USkeletalMeshComponent* HandMesh = Cast<USkeletalMeshComponent>(GetAttachParent());
+	if (!HandMesh)
 	{
-		FinalLocation -= AimRotation.GetForwardVector() * GripDepthOffset;
+		return;
 	}
 
-	SetWorldLocationAndRotation(FinalLocation, AimRotation);
+	// The MESH takes BOTH its location and rotation from the hand socket, so it is
+	// oriented exactly the way the fingers are curled and reads as genuinely gripped.
+	// Doing this per tick (rather than via rigid attachment) is deliberate: socket
+	// queries see the holding-pose bone override, a rigid child would not.
+	const FQuat SocketQuat = HandMesh->GetSocketQuaternion(HandSocketName);
+	const FQuat MeshRotation = SocketQuat * GripOffsetRotation.Quaternion();
+	FVector FinalLocation = HandMesh->GetSocketLocation(HandSocketName) + MeshRotation.RotateVector(GripOffsetLocation);
+	if (!FMath::IsNearlyZero(GripDepthOffset))
+	{
+		FinalLocation -= MeshRotation.GetForwardVector() * GripDepthOffset;
+	}
+	SetWorldLocationAndRotation(FinalLocation, MeshRotation);
+
+	// The BEAM is steered independently, straight from the camera. The arm mesh hangs
+	// off the body rather than the camera, so a beam inheriting the hand's rotation
+	// would never aim true when looking up or down. Splitting mesh from beam is what
+	// lets the flashlight look held AND land exactly on the crosshair at once.
+	SpotLight->SetWorldRotation(Camera->GetComponentQuat());
 }
 
 void UFlashlightComponent::TryBindInput()
