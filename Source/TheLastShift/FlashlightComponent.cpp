@@ -2,12 +2,14 @@
 #include "Components/StaticMeshComponent.h"
 #include "Components/SpotLightComponent.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Camera/CameraComponent.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
 #include "InputAction.h"
 #include "InputMappingContext.h"
+#include "Kismet/KismetSystemLibrary.h"
 
 UFlashlightComponent::UFlashlightComponent()
 {
@@ -19,6 +21,7 @@ UFlashlightComponent::UFlashlightComponent()
 	FlashlightMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	FlashlightMesh->SetCastShadow(true);
 	FlashlightMesh->SetOnlyOwnerSee(false);
+	FlashlightMesh->SetVisibility(false);
 
 	// Attached to the mesh (not to this component) so the beam is rigidly locked
 	// to the mesh's lens end and always rotates exactly with it.
@@ -58,6 +61,7 @@ void UFlashlightComponent::BeginPlay()
 
 	bIsOn = bStartsOn;
 	SpotLight->SetVisibility(bIsOn);
+	FlashlightMesh->SetVisibility(bIsOn);
 
 	TryBindInput();
 	// NOTE: tick is intentionally left enabled (see TickComponent) -- it also
@@ -131,9 +135,82 @@ void UFlashlightComponent::TryAttachToHand(bool bRequireTargetRegistered)
 		return;
 	}
 
-	AttachToComponent(ResolvedHandMesh, FAttachmentTransformRules::SnapToTargetNotIncludingScale, HandSocketName);
-	SetRelativeLocation(GripOffsetLocation);
-	SetRelativeRotation(GripOffsetRotation);
+	// Only the parent/socket RELATIONSHIP is established here; the actual transform
+	// is fully recomputed every tick in TickComponent (see UpdateAimedTransform),
+	// because this rig's hand socket only turns with yaw, not pitch -- relying on
+	// its rotation would mean the beam ignores looking up/down entirely.
+	AttachToComponent(ResolvedHandMesh, FAttachmentTransformRules::KeepWorldTransform, HandSocketName);
+
+	if (BoundArmMesh != ResolvedHandMesh)
+	{
+		if (BoundArmMesh.IsValid())
+		{
+			BoundArmMesh->UnregisterOnBoneTransformsFinalizedDelegate(ArmBoneTransformsFinalizedHandle);
+			RemoveTickPrerequisiteComponent(BoundArmMesh.Get());
+		}
+		ArmBoneTransformsFinalizedHandle = ResolvedHandMesh->RegisterOnBoneTransformsFinalizedDelegate(
+			FOnBoneTransformsFinalizedMultiCast::FDelegate::CreateUObject(this, &UFlashlightComponent::OnArmBoneTransformsFinalized));
+		// Guarantees our tick (which reads the hand socket's position) always runs
+		// AFTER the arm's animation update + pose override above, avoiding a
+		// one-frame lag between the raised pose and where the flashlight sits.
+		AddTickPrerequisiteComponent(ResolvedHandMesh);
+		BoundArmMesh = ResolvedHandMesh;
+	}
+}
+
+void UFlashlightComponent::OnArmBoneTransformsFinalized()
+{
+	if (!bIsOn || !BoundArmMesh.IsValid())
+	{
+		return;
+	}
+	USkeletalMeshComponent* Mesh = BoundArmMesh.Get();
+
+	static const FName PivotBone("upperarm_r");
+	static const TArray<FName> ChainBones = {
+		"upperarm_r", "upperarm_twist_01_r", "upperarm_twist_02_r",
+		"lowerarm_r", "lowerarm_twist_01_r", "lowerarm_twist_02_r", "hand_r",
+		"index_metacarpal_r", "index_01_r", "index_02_r", "index_03_r",
+		"middle_metacarpal_r", "middle_01_r", "middle_02_r", "middle_03_r",
+		"ring_metacarpal_r", "ring_01_r", "ring_02_r", "ring_03_r",
+		"pinky_metacarpal_r", "pinky_01_r", "pinky_02_r", "pinky_03_r",
+		"thumb_01_r", "thumb_02_r", "thumb_03_r"
+	};
+
+	const int32 PivotIndex = Mesh->GetBoneIndex(PivotBone);
+	if (PivotIndex == INDEX_NONE)
+	{
+		return;
+	}
+
+	TArray<FTransform>& ComponentSpaceTransforms = Mesh->GetEditableComponentSpaceTransforms();
+	const FVector PivotLocation = ComponentSpaceTransforms[PivotIndex].GetLocation();
+	const FQuat DeltaRotation = HoldingPoseArmRotation.Quaternion();
+
+	// Resolve bone indices and snapshot original transforms first, then write them
+	// all back rotated -- so writing an earlier bone in the chain can't affect what
+	// we read for a later one.
+	TArray<int32> BoneIndices;
+	TArray<FTransform> OriginalTransforms;
+	BoneIndices.Reserve(ChainBones.Num());
+	OriginalTransforms.Reserve(ChainBones.Num());
+	for (const FName& BoneName : ChainBones)
+	{
+		const int32 Index = Mesh->GetBoneIndex(BoneName);
+		if (Index != INDEX_NONE)
+		{
+			BoneIndices.Add(Index);
+			OriginalTransforms.Add(ComponentSpaceTransforms[Index]);
+		}
+	}
+
+	for (int32 i = 0; i < BoneIndices.Num(); ++i)
+	{
+		const FTransform& Old = OriginalTransforms[i];
+		const FVector NewLocation = PivotLocation + DeltaRotation.RotateVector(Old.GetLocation() - PivotLocation);
+		const FQuat NewRotation = DeltaRotation * Old.GetRotation();
+		ComponentSpaceTransforms[BoneIndices[i]] = FTransform(NewRotation, NewLocation, Old.GetScale3D());
+	}
 }
 
 void UFlashlightComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -151,6 +228,41 @@ void UFlashlightComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 	// Re-checking every tick (cheap: just a parent/socket comparison, see below)
 	// guarantees the flashlight stays gripped in the hand no matter when that happens.
 	TryAttachToHand(/*bRequireTargetRegistered=*/false);
+
+	UpdateAimedTransform();
+}
+
+void UFlashlightComponent::UpdateAimedTransform()
+{
+	USkeletalMeshComponent* HandMesh = Cast<USkeletalMeshComponent>(GetAttachParent());
+	APawn* Pawn = Cast<APawn>(GetOwner());
+	if (!HandMesh || !Pawn)
+	{
+		return;
+	}
+
+	UCameraComponent* Camera = Pawn->FindComponentByClass<UCameraComponent>();
+	if (!Camera)
+	{
+		return;
+	}
+
+	// Position: follows the hand socket's actual (animated) location every frame,
+	// so it visually moves and sways with the hand during walking/idling.
+	// Rotation: driven directly from the camera, NOT the socket -- this rig's hand
+	// bone only turns with yaw (confirmed by measurement), so using its rotation
+	// would mean the beam never responds to looking up/down. Driving rotation from
+	// the camera guarantees the beam always points exactly where the player aims.
+	const FVector HandLocation = HandMesh->GetSocketLocation(HandSocketName);
+	const FQuat AimRotation = GripOffsetRotation.Quaternion() * Camera->GetComponentQuat();
+
+	FVector FinalLocation = HandLocation + AimRotation.RotateVector(GripOffsetLocation);
+	if (!FMath::IsNearlyZero(GripDepthOffset))
+	{
+		FinalLocation -= AimRotation.GetForwardVector() * GripDepthOffset;
+	}
+
+	SetWorldLocationAndRotation(FinalLocation, AimRotation);
 }
 
 void UFlashlightComponent::TryBindInput()
@@ -197,4 +309,5 @@ void UFlashlightComponent::SetFlashlightOn(bool bNewOn)
 {
 	bIsOn = bNewOn;
 	SpotLight->SetVisibility(bIsOn);
+	FlashlightMesh->SetVisibility(bIsOn);
 }
