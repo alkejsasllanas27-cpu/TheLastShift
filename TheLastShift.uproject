@@ -3,6 +3,13 @@
 	"EngineAssociation": "5.8",
 	"Category": "Horror",
 	"Description": "The Last Shift - Survival Horror",
+	"Modules": [
+		{
+			"Name": "TheLastShift",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	],
 	"Plugins": [
 		{
 			"Name": "ModelingToolsEditorMode",
