@@ -282,6 +282,11 @@ void UFlashlightComponent::OnArmBoneTransformsFinalized()
 void UFlashlightComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	if (bIsOn)
+	{
+		BatteryCharge = FMath::Max(0.f, BatteryCharge - DeltaTime / FMath::Max(30.f, BatteryRuntimeSeconds));
+		if (BatteryCharge <= 0.f) SetFlashlightOn(false);
+	}
 
 	if (!bInputBound)
 	{
@@ -380,7 +385,14 @@ void UFlashlightComponent::ToggleFlashlight()
 
 void UFlashlightComponent::SetFlashlightOn(bool bNewOn)
 {
-	bIsOn = bNewOn;
+	bIsOn = bNewOn && BatteryCharge > 0.f;
 	SpotLight->SetVisibility(bIsOn);
 	FlashlightMesh->SetVisibility(bIsOn);
+}
+
+bool UFlashlightComponent::ReplaceBattery()
+{
+	if (BatteryCharge >= 0.98f) return false;
+	BatteryCharge = 1.f;
+	return true;
 }

@@ -107,6 +107,13 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Flashlight")
 	bool IsFlashlightOn() const { return bIsOn; }
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flashlight|Battery", meta=(ClampMin="0", ClampMax="1"))
+	float BatteryCharge = 0.65f;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flashlight|Battery", meta=(ClampMin="30"))
+	float BatteryRuntimeSeconds = 600.f;
+	UFUNCTION(BlueprintCallable, Category="Flashlight|Battery")
+	bool ReplaceBattery();
+
 protected:
 	virtual void OnRegister() override;
 	virtual void BeginPlay() override;
