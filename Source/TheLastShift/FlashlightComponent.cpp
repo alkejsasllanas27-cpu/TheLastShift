@@ -1,6 +1,7 @@
-#include "FlashlightComponent.h"
+﻿#include "FlashlightComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SpotLightComponent.h"
+#include "Components/PointLightComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/Pawn.h"
@@ -10,6 +11,10 @@
 #include "InputAction.h"
 #include "InputMappingContext.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "Engine/World.h"
+
+// Where the beam leaves the flashlight mesh, in the mesh's local space.
+static const FVector FlashlightLensOffset(13.f, 0.f, 0.f);
 
 UFlashlightComponent::UFlashlightComponent()
 {
@@ -19,15 +24,34 @@ UFlashlightComponent::UFlashlightComponent()
 	FlashlightMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("FlashlightMesh"));
 	FlashlightMesh->SetupAttachment(this);
 	FlashlightMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	FlashlightMesh->SetCastShadow(true);
-	FlashlightMesh->SetOnlyOwnerSee(false);
+	// The arms render as first-person primitives; the flashlight must too, or it is drawn
+	// at its true world position (behind/below the camera) instead of in the rendered hand.
+	FlashlightMesh->SetFirstPersonPrimitiveType(EFirstPersonPrimitiveType::FirstPerson);
+	FlashlightMesh->SetCastShadow(false);
+	FlashlightMesh->SetOnlyOwnerSee(true);
 	FlashlightMesh->SetVisibility(false);
+	FlashlightMesh->LightingChannels.bChannel0 = false;
+	FlashlightMesh->LightingChannels.bChannel1 = true;
 
-	// Attached to the mesh (not to this component) so the beam is rigidly locked
-	// to the mesh's lens end and always rotates exactly with it.
+	ViewmodelFill = CreateDefaultSubobject<UPointLightComponent>(TEXT("ViewmodelFill"));
+	ViewmodelFill->SetupAttachment(FlashlightMesh);
+	// Above and to the inner side of the body, so both the head and the barrel read in the dark.
+	ViewmodelFill->SetRelativeLocation(FVector(8.f, -14.f, 16.f));
+	ViewmodelFill->IntensityUnits = ELightUnits::Candelas;
+	ViewmodelFill->Intensity = ViewmodelFillIntensity;
+	ViewmodelFill->AttenuationRadius = 70.f;
+	ViewmodelFill->CastShadows = false;
+	ViewmodelFill->LightingChannels.bChannel0 = false;
+	ViewmodelFill->LightingChannels.bChannel1 = true;
+	ViewmodelFill->SetLightColor(FLinearColor(1.f, .9f, .8f));
+	ViewmodelFill->Mobility = EComponentMobility::Movable;
+	ViewmodelFill->SetVisibility(false);
+
+	// Attached to the mesh (not to this component) so it follows the flashlight when
+	// the component isn't ticking; during play UpdateAimedTransform places and aims it.
 	SpotLight = CreateDefaultSubobject<USpotLightComponent>(TEXT("SpotLight"));
 	SpotLight->SetupAttachment(FlashlightMesh);
-	SpotLight->SetRelativeLocation(FVector(13.f, 0.f, 0.f));
+	SpotLight->SetRelativeLocation(FlashlightLensOffset);
 	SpotLight->SetRelativeRotation(FRotator::ZeroRotator);
 
 	SpotLight->Intensity = 3000.f;
@@ -61,9 +85,7 @@ void UFlashlightComponent::BeginPlay()
 
 	DisableLegacyFlashlightComponents();
 
-	bIsOn = bStartsOn;
-	SpotLight->SetVisibility(bIsOn);
-	FlashlightMesh->SetVisibility(bIsOn);
+	SetFlashlightOn(bStartsOn);
 
 	TryBindInput();
 	// NOTE: tick is intentionally left enabled (see TickComponent) -- it also
@@ -300,10 +322,10 @@ void UFlashlightComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 	// guarantees the flashlight stays gripped in the hand no matter when that happens.
 	TryAttachToHand(/*bRequireTargetRegistered=*/false);
 
-	UpdateAimedTransform();
+	UpdateAimedTransform(DeltaTime);
 }
 
-void UFlashlightComponent::UpdateAimedTransform()
+void UFlashlightComponent::UpdateAimedTransform(float DeltaTime)
 {
 	APawn* Pawn = Cast<APawn>(GetOwner());
 	if (!Pawn)
@@ -336,11 +358,47 @@ void UFlashlightComponent::UpdateAimedTransform()
 	}
 	SetWorldLocationAndRotation(FinalLocation, MeshRotation);
 
-	// The BEAM is steered independently, straight from the camera. The arm mesh hangs
-	// off the body rather than the camera, so a beam inheriting the hand's rotation
-	// would never aim true when looking up or down. Splitting mesh from beam is what
-	// lets the flashlight look held AND land exactly on the crosshair at once.
-	SpotLight->SetWorldRotation(Camera->GetComponentQuat());
+	if (bViewmodelPlacement)
+	{
+		// This rig's arms are not drawn in first person, so a flashlight on the hand socket
+		// is never on screen. Hold it at a fixed spot in view instead, trailing camera turns
+		// slightly so it reads as carried rather than glued to the lens.
+		const FQuat CameraQuat = Camera->GetComponentQuat();
+		const FQuat TargetQuat = CameraQuat * ViewmodelRotation.Quaternion();
+		ViewmodelQuat = bViewmodelPlaced
+			? FQuat::Slerp(ViewmodelQuat, TargetQuat, FMath::Clamp(DeltaTime * ViewmodelSwaySpeed, 0.f, 1.f))
+			: TargetQuat;
+		bViewmodelPlaced = true;
+		FlashlightMesh->SetWorldLocationAndRotation(Camera->GetComponentLocation() + CameraQuat.RotateVector(ViewmodelOffset), ViewmodelQuat);
+	}
+
+	// The BEAM is steered independently from the camera. The arm mesh hangs off the body
+	// rather than the camera, so a beam inheriting the hand's rotation would never aim
+	// true when looking up or down. Splitting mesh from beam is what lets the flashlight
+	// look held AND land exactly on the crosshair at once.
+	const FVector CameraLocation = Camera->GetComponentLocation();
+	const FVector CameraForward = Camera->GetForwardVector();
+
+	// Aim at what the crosshair is on rather than parallel to the view: the hand is well
+	// below the eye, so a parallel beam puts its hotspot under the crosshair up close.
+	float TargetDistance = BeamConvergeMaxDistance;
+	FHitResult Hit;
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(FlashlightAim), /*bTraceComplex=*/false, Pawn);
+	if (GetWorld()->LineTraceSingleByChannel(Hit, CameraLocation, CameraLocation + CameraForward * BeamConvergeMaxDistance, ECC_Visibility, QueryParams))
+	{
+		TargetDistance = Hit.Distance;
+	}
+	TargetDistance = FMath::Max(TargetDistance, BeamConvergeMinDistance);
+	// Only the distance is smoothed, never the direction, so the beam never trails the view
+	// when turning -- it just doesn't pop when the crosshair slides off an edge.
+	SmoothedConvergeDistance = SmoothedConvergeDistance <= 0.f
+		? TargetDistance
+		: FMath::FInterpTo(SmoothedConvergeDistance, TargetDistance, DeltaTime, BeamConvergeInterpSpeed);
+
+	const FVector LensLocation = FlashlightMesh->GetComponentTransform().TransformPosition(FlashlightLensOffset);
+	const FVector BeamOrigin = FMath::Lerp(LensLocation, CameraLocation, BeamOriginTowardEye);
+	const FVector AimPoint = CameraLocation + CameraForward * SmoothedConvergeDistance;
+	SpotLight->SetWorldLocationAndRotation(BeamOrigin, (AimPoint - BeamOrigin).ToOrientationQuat());
 }
 
 void UFlashlightComponent::TryBindInput()
@@ -385,9 +443,18 @@ void UFlashlightComponent::ToggleFlashlight()
 
 void UFlashlightComponent::SetFlashlightOn(bool bNewOn)
 {
-	bIsOn = bNewOn && BatteryCharge > 0.f;
+	bIsOn = bNewOn && bHasFlashlight && BatteryCharge > 0.f;
 	SpotLight->SetVisibility(bIsOn);
-	FlashlightMesh->SetVisibility(bIsOn);
+	FlashlightMesh->SetVisibility(bHasFlashlight);
+	// Dimmer when off: there's no beam bouncing back onto the flashlight.
+	ViewmodelFill->SetVisibility(bHasFlashlight);
+	ViewmodelFill->SetIntensity(bIsOn ? ViewmodelFillIntensity : ViewmodelFillIntensity * .35f);
+}
+
+void UFlashlightComponent::GiveFlashlight()
+{
+	bHasFlashlight = true;
+	SetFlashlightOn(true);
 }
 
 bool UFlashlightComponent::ReplaceBattery()

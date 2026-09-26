@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "CoreMinimal.h"
 #include "Components/SceneComponent.h"
@@ -6,6 +6,7 @@
 
 class UStaticMeshComponent;
 class USpotLightComponent;
+class UPointLightComponent;
 class USkeletalMeshComponent;
 class UInputAction;
 class UInputMappingContext;
@@ -29,7 +30,7 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Flashlight")
 	TObjectPtr<UStaticMeshComponent> FlashlightMesh;
 
-	/** The beam. Attached as a child of FlashlightMesh so it inherits its exact rotation. */
+	/** The beam. Parented to FlashlightMesh, but re-placed and aimed at the crosshair target every tick (see UpdateAimedTransform). */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Flashlight")
 	TObjectPtr<USpotLightComponent> SpotLight;
 
@@ -48,6 +49,13 @@ public:
 	/** Whether the flashlight starts switched on when play begins. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight")
 	bool bStartsOn = false;
+
+	/**
+	 * Whether the player owns the flashlight. While false it is neither shown in hand nor
+	 * toggleable; a flashlight pickup in the level grants it via GiveFlashlight.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight")
+	bool bHasFlashlight = true;
 
 	/**
 	 * Optional: a skeletal mesh (e.g. the first-person arms) to visually hold the
@@ -96,6 +104,53 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Pose")
 	FRotator HoldingPoseArmRotation = FRotator(35.f, 10.f, 0.f);
 
+	/**
+	 * The beam converges on whatever the crosshair is pointing at, up to this distance (cm).
+	 * The hand sits well below the eye, so a beam kept parallel to the camera lands its
+	 * hotspot visibly under the crosshair at close range.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Beam", meta = (ClampMin = "100"))
+	float BeamConvergeMaxDistance = 2500.f;
+
+	/** Closest convergence distance (cm), so the beam doesn't swing sharply when hugging a wall. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Beam", meta = (ClampMin = "10"))
+	float BeamConvergeMinDistance = 150.f;
+
+	/** How quickly the convergence distance follows the crosshair target; lower is steadier. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Beam", meta = (ClampMin = "0.1"))
+	float BeamConvergeInterpSpeed = 8.f;
+
+	/**
+	 * Draw the held flashlight at a fixed spot in view (ViewmodelOffset) instead of on the
+	 * hand socket. Needed while the first-person arms are not visible on screen.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Viewmodel")
+	bool bViewmodelPlacement = true;
+
+	/** Where the held flashlight sits relative to the camera, in cm (X forward, Y right, Z up). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Viewmodel", meta = (EditCondition = "bViewmodelPlacement"))
+	FVector ViewmodelOffset = FVector(34.f, 15.f, -16.f);
+
+	/** Rotation of the held flashlight relative to the camera, to fix the mesh's axis or tilt it toward the crosshair. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Viewmodel", meta = (EditCondition = "bViewmodelPlacement"))
+	FRotator ViewmodelRotation = FRotator(3.f, -4.f, -6.f);
+
+	/** Candelas of the small light that only lights the held flashlight (lighting channel 1), so it isn't a black silhouette at night. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Viewmodel", meta = (ClampMin = "0"))
+	float ViewmodelFillIntensity = 1.2f;
+
+	/** Lights only the held flashlight mesh; the world stays on lighting channel 0 and is unaffected. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Flashlight|Viewmodel")
+	TObjectPtr<UPointLightComponent> ViewmodelFill;
+
+	/** How quickly the held flashlight catches up with camera turns; lower sways more. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Viewmodel", meta = (EditCondition = "bViewmodelPlacement", ClampMin = "1"))
+	float ViewmodelSwaySpeed = 14.f;
+
+	/** Moves the light origin from the lens toward the camera (0 = lens, 1 = eye), for higher, more natural shadows. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Beam", meta = (ClampMin = "0", ClampMax = "1"))
+	float BeamOriginTowardEye = 0.75f;
+
 	/** Flips the flashlight between on and off. Safe to call from Blueprint or other C++ systems. */
 	UFUNCTION(BlueprintCallable, Category = "Flashlight")
 	void ToggleFlashlight();
@@ -106,6 +161,13 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "Flashlight")
 	bool IsFlashlightOn() const { return bIsOn; }
+
+	/** Gives the player the flashlight (from a pickup), shows it in hand and switches it on. */
+	UFUNCTION(BlueprintCallable, Category = "Flashlight")
+	void GiveFlashlight();
+
+	UFUNCTION(BlueprintPure, Category = "Flashlight")
+	bool HasFlashlight() const { return bHasFlashlight; }
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flashlight|Battery", meta=(ClampMin="0", ClampMax="1"))
 	float BatteryCharge = 0.65f;
@@ -139,12 +201,19 @@ private:
 	void TryAttachToHand(bool bRequireTargetRegistered);
 
 	/**
-	 * Every tick: positions the flashlight at the hand socket's current (animated)
-	 * location, but drives its ROTATION directly from the camera. This rig's hand
-	 * bone only turns with yaw, not pitch, so using the socket's own rotation would
+	 * Every tick: positions the flashlight mesh at the hand socket's current (animated)
+	 * location, and aims the beam from the camera at the crosshair target. This rig's
+	 * hand bone only turns with yaw, not pitch, so using the socket's own rotation would
 	 * mean the beam never follows looking up/down -- this guarantees it always does.
 	 */
-	void UpdateAimedTransform();
+	void UpdateAimedTransform(float DeltaTime);
+
+	/** Smoothed distance to the crosshair target the beam converges on; 0 until first aimed. */
+	float SmoothedConvergeDistance = 0.f;
+
+	/** Lagged world rotation of the held flashlight in viewmodel placement. */
+	FQuat ViewmodelQuat = FQuat::Identity;
+	bool bViewmodelPlaced = false;
 
 	/** Bound to the arm mesh's OnBoneTransformsFinalized so our pose override applies AFTER animation, not before (otherwise it would just get overwritten). */
 	void OnArmBoneTransformsFinalized();

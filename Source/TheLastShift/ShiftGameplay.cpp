@@ -1,8 +1,9 @@
-#include "ShiftGameplay.h"
+﻿#include "ShiftGameplay.h"
 #include "FlashlightComponent.h"
 #include "ShiftLadder.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/BoxComponent.h"
+#include "Components/PointLightComponent.h"
 #include "Components/AudioComponent.h"
 #include "Components/TextBlock.h"
 #include "Components/ProgressBar.h"
@@ -16,6 +17,7 @@
 #include "Components/CanvasPanelSlot.h"
 #include "Components/InputComponent.h"
 #include "Blueprint/WidgetTree.h"
+#include "Components/Image.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
@@ -54,11 +56,19 @@ void AShiftInteractable::OnConstruction(const FTransform& T){Super::OnConstructi
 void AShiftInteractable::Rebuild()
 {
  for(auto P:Parts)if(IsValid(P))P->DestroyComponent();Parts.Empty();
+ for(auto L:Lights)if(IsValid(L))L->DestroyComponent();Lights.Empty();
  MovingRoot->SetRelativeTransform(FTransform::Identity);
  if(Kind==EShiftObjectKind::Battery){
   auto* C=Part(TEXT("BatteryBody"),FVector(0,0,4),FVector(4,4,8),RootComponent,true);
   C->SetStaticMesh(LoadObject<UStaticMesh>(nullptr,TEXT("/Engine/BasicShapes/Cylinder.Cylinder")));
   Part(TEXT("BatteryCap"),FVector(0,0,8.3),FVector(2.4,2.4,.6),RootComponent,true);
+ }else if(Kind==EShiftObjectKind::Flashlight){
+  auto* C=Part(TEXT("FlashlightBody"),FVector(-13,0,5.2),FVector(100),RootComponent,true);
+  C->SetStaticMesh(LoadObject<UStaticMesh>(nullptr,TEXT("/Game/Flashlight/Meshes/SM_FlashlightReal.SM_FlashlightReal")));C->EmptyOverrideMaterials();
+  // A faint warm glint so the pickup can be spotted in the dark without reading as a lamp.
+  auto* Glint=NewObject<UPointLightComponent>(this,TEXT("FlashlightGlint"));Glint->CreationMethod=EComponentCreationMethod::UserConstructionScript;
+  Glint->SetupAttachment(RootComponent);Glint->SetRelativeLocation(FVector(0,0,18));Glint->SetIntensityUnits(ELightUnits::Candelas);Glint->SetIntensity(1.2f);
+  Glint->SetAttenuationRadius(160);Glint->SetLightColor(FLinearColor(1,.78f,.5f));Glint->SetCastShadows(false);Glint->SetMobility(EComponentMobility::Movable);Glint->RegisterComponent();Lights.Add(Glint);
  }else if(Kind==EShiftObjectKind::Note){
   Part(TEXT("Paper"),FVector(0,0,.2),FVector(22,16,.4),RootComponent,false);
  }else if(Kind==EShiftObjectKind::Switch){
@@ -114,13 +124,14 @@ void AShiftInteractable::Tick(float Dt)
 bool AShiftInteractable::IsAvailable()const{return !bOccupied&&(!Container||Container->OpenAlpha>.9f);}
 FText AShiftInteractable::GetPrompt()const
 {
- switch(Kind){case EShiftObjectKind::Battery:return FText::FromString(TEXT("[E] Pick up battery"));case EShiftObjectKind::Note:return FText::FromString(TEXT("[E] Read"));case EShiftObjectKind::HidingCabinet:return FText::FromString(TEXT("[E] Hide"));case EShiftObjectKind::Switch:return FText::FromString(TEXT("[E] Use"));default:return FText::FromString(bOpen?TEXT("[E] Close"):TEXT("[E] Open"));}
+ switch(Kind){case EShiftObjectKind::Battery:return FText::FromString(TEXT("[E] Pick up battery"));case EShiftObjectKind::Flashlight:return FText::FromString(TEXT("[E] Pick up flashlight"));case EShiftObjectKind::Note:return FText::FromString(TEXT("[E] Read"));case EShiftObjectKind::HidingCabinet:return FText::FromString(TEXT("[E] Hide"));case EShiftObjectKind::Switch:return FText::FromString(TEXT("[E] Use"));default:return FText::FromString(bOpen?TEXT("[E] Close"):TEXT("[E] Open"));}
 }
 void AShiftInteractable::Interact(AShiftDirector* D)
 {
  if(!D||!IsAvailable())return;
  switch(Kind){
  case EShiftObjectKind::Battery:if(D->SpareBatteries>=3){D->Notify(TEXT("Battery pouch full"));return;}D->AddBattery();Sound(this,UseSound);Destroy();break;
+ case EShiftObjectKind::Flashlight:D->PickUpFlashlight();Sound(this,UseSound);Destroy();break;
  case EShiftObjectKind::Note:D->ReadNote(NoteText,StoryEvent);Sound(this,UseSound);break;
  case EShiftObjectKind::HidingCabinet:D->EnterHiding(this);break;
  case EShiftObjectKind::Switch:D->TriggerStory(StoryEvent);Sound(this,UseSound);D->Notify(TEXT("Power relay engaged"));break;
@@ -131,6 +142,15 @@ void AShiftInteractable::Interact(AShiftDirector* D)
 void UShiftPromptWidget::NativeOnInitialized()
 {
  Super::NativeOnInitialized();auto* Canvas=WidgetTree->ConstructWidget<UCanvasPanel>();WidgetTree->RootWidget=Canvas;
+ // The reticle follows the viewport center at every resolution and DPI scale.
+ auto* AimDot=WidgetTree->ConstructWidget<UImage>(UImage::StaticClass(),TEXT("AimDot"));
+ FSlateBrush DotBrush;DotBrush.DrawAs=ESlateBrushDrawType::RoundedBox;
+ DotBrush.TintColor=FSlateColor(FLinearColor(.95f,.95f,.90f));
+ DotBrush.OutlineSettings=FSlateBrushOutlineSettings(2.f,FLinearColor(0,0,0,.8f),1.f);
+ AimDot->SetBrush(DotBrush);
+ auto* AimSlot=Canvas->AddChildToCanvas(AimDot);AimSlot->SetAnchors(FAnchors(.5f,.5f));
+ AimSlot->SetAlignment(FVector2D(.5f,.5f));AimSlot->SetPosition(FVector2D::ZeroVector);AimSlot->SetSize(FVector2D(5,5));
+
  auto Add=[&](UTextBlock*& Text,FVector2D Pos,FVector2D Size,int32 Font){Text=WidgetTree->ConstructWidget<UTextBlock>();Text->SetFont(FSlateFontInfo(FCoreStyle::GetDefaultFontStyle("Regular",Font)));Text->SetColorAndOpacity(FSlateColor(FLinearColor(.85f,.85f,.80f)));Text->SetShadowColorAndOpacity(FLinearColor(0,0,0,.9f));Text->SetShadowOffset(FVector2D(1,1));Text->SetJustification(ETextJustify::Center);Text->SetAutoWrapText(true);auto* Slot=Canvas->AddChildToCanvas(Text);Slot->SetAnchors(FAnchors(.5f,.5f));Slot->SetAlignment(FVector2D(.5f,0));Slot->SetPosition(Pos);Slot->SetSize(Size);};
  UTextBlock* T=nullptr;Add(T,FVector2D(0,95),FVector2D(450,45),16);PromptText=T;
  Add(T,FVector2D(0,140),FVector2D(550,65),15);StatusText=T;
@@ -150,6 +170,7 @@ void UShiftPromptWidget::UpdateBattery(float Charge,int32 Spares,bool On)
  BatteryText->SetText(FText::FromString(FString::Printf(TEXT("FLASHLIGHT  %d%%  |  %s\nSPARES  %d / 3  ·  R REPLACE"),FMath::CeilToInt(Charge*100),On?TEXT("ON"):TEXT("OFF"),Spares)));
  FLinearColor Color=Charge<=.15f?FLinearColor(.9f,.25f,.12f):FLinearColor(.68f,.77f,.67f);BatteryBar->SetPercent(Charge);BatteryBar->SetFillColorAndOpacity(Color);
 }
+void UShiftPromptWidget::SetBatteryVisible(bool Visible){const ESlateVisibility V=Visible?ESlateVisibility::HitTestInvisible:ESlateVisibility::Collapsed;if(BatteryText)BatteryText->SetVisibility(V);if(BatteryBar)BatteryBar->SetVisibility(V);}
 void UShiftPromptWidget::UpdateObjective(const FString& Objective){if(ObjectiveText)ObjectiveText->SetText(FText::FromString(Objective));}
 
 AShiftDirector::AShiftDirector(){PrimaryActorTick.bCanEverTick=true;SetActorHiddenInGame(true);}
@@ -180,11 +201,12 @@ void AShiftDirector::UpdateFocus()
  // A deliberate hit on another interaction (for example a note) keeps priority.
  auto* DirectObject=Cast<AShiftInteractable>(FocusedActor);
  if(FocusedActor&&(!DirectObject||(DirectObject->Kind!=EShiftObjectKind::Drawer&&DirectObject->Kind!=EShiftObjectKind::Cabinet)))return;
- if(SpareBatteries>=3)return;
  const FVector Forward=Rot.Vector();float BestScore=TNumericLimits<float>::Max();
  for(TActorIterator<AShiftInteractable> It(GetWorld());It;++It){
   AShiftInteractable* Battery=*It;
-  if(Battery->Kind!=EShiftObjectKind::Battery||!Battery->IsAvailable())continue;
+  // Batteries and the flashlight are the small pickups; a full pouch only rules out batteries.
+  if(Battery->Kind==EShiftObjectKind::Battery?SpareBatteries>=3:Battery->Kind!=EShiftObjectKind::Flashlight)continue;
+  if(!Battery->IsAvailable())continue;
   if(DirectObject&&Battery->Container!=DirectObject)continue;
   FVector Center,Extent;Battery->GetActorBounds(true,Center,Extent);
   const FVector ToBattery=Center-Loc;const float Distance=ToBattery.Size();
@@ -224,11 +246,11 @@ void AShiftDirector::Tick(float Dt)
  TraceClock+=Dt;if(TraceClock>=.1f){TraceClock=0;UpdateFocus();}
  if(PC->WasInputKeyJustPressed(EKeys::E))Interact();
  if(PC->WasInputKeyJustPressed(EKeys::R)&&!bPlayerHidden&&!ActiveLadder&&Reading.IsEmpty())ReloadBattery();
- if(Flashlight){bool Low=Flashlight->BatteryCharge<=.15f;if(Low&&!bWasLow)Notify(TEXT("Flashlight battery low"),5);bWasLow=Low;}
+ if(Flashlight&&Flashlight->HasFlashlight()){bool Low=Flashlight->BatteryCharge<=.15f;if(Low&&!bWasLow)Notify(TEXT("Flashlight battery low"),5);bWasLow=Low;}
  if(Widget)Widget->Show(Prompt(),GetWorld()->GetTimeSeconds()<StatusUntil?Status:TEXT(""),Reading);
- if(Widget&&Flashlight)Widget->UpdateBattery(Flashlight->BatteryCharge,SpareBatteries,Flashlight->IsFlashlightOn());
+ if(Widget&&Flashlight){Widget->SetBatteryVisible(Flashlight->HasFlashlight());Widget->UpdateBattery(Flashlight->BatteryCharge,SpareBatteries,Flashlight->IsFlashlightOn());}
  if(ObjectiveStage==2&&Player->GetActorLocation().X<-13300&&FMath::Abs(Player->GetActorLocation().Y-2242)<500){ObjectiveStage=3;ReadNote(FText::FromString(TEXT("SHIFT COMPLETE\n\nYou recovered the maintenance record and left the hospital.\n\nThe power failure was no accident.\n\n[E] Return to exploration")),NAME_None);}
- if(Widget){const TCHAR* Objectives[]={TEXT("NIGHT SHIFT\nFind the log at reception."),TEXT("MAINTENANCE RECORD\nSearch the storage cabinet in the first room."),TEXT("LEAVE THE HOSPITAL\nReturn outside through the main gate."),TEXT("SHIFT COMPLETE\nMaintenance record recovered.")};Widget->UpdateObjective(Objectives[FMath::Clamp(ObjectiveStage,0,3)]);}
+ if(Widget){const TCHAR* Objectives[]={TEXT("NIGHT SHIFT\nFind the log at reception."),TEXT("MAINTENANCE RECORD\nSearch the storage cabinet in the first room."),TEXT("LEAVE THE HOSPITAL\nReturn outside through the main gate."),TEXT("SHIFT COMPLETE\nMaintenance record recovered.")};Widget->UpdateObjective(ObjectiveStage==0&&Flashlight&&!Flashlight->HasFlashlight()?TEXT("NIGHT SHIFT\nFind a flashlight near the entrance gate."):Objectives[FMath::Clamp(ObjectiveStage,0,3)]);}
 }
 void AShiftDirector::Interact()
 {
@@ -247,7 +269,8 @@ void AShiftDirector::Interact()
 }
 void AShiftDirector::Notify(const FString& Text,float Seconds){Status=Text;StatusUntil=GetWorld()->GetTimeSeconds()+Seconds;}
 void AShiftDirector::AddBattery(){SpareBatteries=FMath::Min(3,SpareBatteries+1);Notify(FString::Printf(TEXT("Battery collected  |  Spares: %d  |  R to replace"),SpareBatteries));}
-void AShiftDirector::ReloadBattery(){if(!Flashlight)return;if(SpareBatteries<1){Notify(TEXT("No spare batteries"));return;}if(Flashlight->ReplaceBattery()){--SpareBatteries;Notify(FString::Printf(TEXT("Battery replaced  |  Spares: %d"),SpareBatteries));}else Notify(TEXT("Battery is already full"));}
+void AShiftDirector::PickUpFlashlight(){if(!Flashlight)return;Flashlight->GiveFlashlight();Notify(TEXT("Flashlight picked up  |  F to toggle"),5);}
+void AShiftDirector::ReloadBattery(){if(!Flashlight)return;if(!Flashlight->HasFlashlight()){Notify(TEXT("You need a flashlight first"));return;}if(SpareBatteries<1){Notify(TEXT("No spare batteries"));return;}if(Flashlight->ReplaceBattery()){--SpareBatteries;Notify(FString::Printf(TEXT("Battery replaced  |  Spares: %d"),SpareBatteries));}else Notify(TEXT("Battery is already full"));}
 void AShiftDirector::ReadNote(const FText& Text,FName Event){Reading=Text.ToString();TriggerStory(Event);}
 void AShiftDirector::EnterHiding(AShiftInteractable* Cabinet)
 {

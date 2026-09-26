@@ -11,9 +11,10 @@ public class TheLastShift : ModuleRules
 			"CoreUObject",
 			"Engine",
 			"InputCore",
-			"EnhancedInput", "UMG", "Slate", "SlateCore"
+			"EnhancedInput", "AIModule", "UMG", "Slate", "SlateCore"
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[] { });
 	}
 }
+

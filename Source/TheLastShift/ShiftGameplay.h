@@ -16,7 +16,7 @@ class AShiftDirector;
 class AShiftLadder;
 
 UENUM(BlueprintType)
-enum class EShiftObjectKind : uint8 { Battery, Drawer, Cabinet, HidingCabinet, Note, Switch };
+enum class EShiftObjectKind : uint8 { Battery, Drawer, Cabinet, HidingCabinet, Note, Switch, Flashlight };
 
 /** One reusable interaction contract for authored objects. Legacy doors are adapted by the director. */
 UCLASS()
@@ -48,6 +48,7 @@ public:
  virtual void OnConstruction(const FTransform& Transform) override;
 private:
  UPROPERTY() TArray<TObjectPtr<UStaticMeshComponent>> Parts;
+ UPROPERTY() TArray<TObjectPtr<class UPointLightComponent>> Lights;
  UStaticMeshComponent* Part(FName Name,FVector Location,FVector Size,USceneComponent* Parent,bool Metal=false);
  void ApplyPose();
 };
@@ -60,6 +61,7 @@ public:
  virtual void NativeOnInitialized() override;
  void Show(const FString& Prompt,const FString& Status,const FString& Note);
  void UpdateBattery(float Charge,int32 Spares,bool On);
+ void SetBatteryVisible(bool Visible);
  void UpdateObjective(const FString& Objective);
 private:
  UPROPERTY() TObjectPtr<UTextBlock> ObjectiveText;
@@ -109,6 +111,7 @@ public:
  UFUNCTION(BlueprintCallable) void Interact();
  UFUNCTION(BlueprintCallable) void ReloadBattery();
  UFUNCTION(BlueprintCallable) void AddBattery();
+ UFUNCTION(BlueprintCallable) void PickUpFlashlight();
  UFUNCTION(BlueprintCallable) void EnterHiding(AShiftInteractable* Cabinet);
  UFUNCTION(BlueprintCallable) void ExitHiding();
  UFUNCTION(BlueprintCallable) void ReadNote(const FText& Text,FName StoryEvent);

@@ -73,6 +73,8 @@ void AShiftLadder::Rebuild()
  Width=FMath::Max(35.f,Width);
  InteractionTarget->SetRelativeLocation(FVector(12,0,Height*.5f));
  InteractionTarget->SetBoxExtent(FVector(18,Width*.5f+8,Height*.5f+30));
+ // Bind an imported level ladder without drawing a second ladder over it.
+ if(ActorHasTag(TEXT("UseLevelLadderMesh"))) return;
  if(LadderMesh)
  {
   auto* Part=AddPart(TEXT("AuthoredLadder"),FVector::ZeroVector,FVector(100));
@@ -101,7 +103,7 @@ FVector AShiftLadder::EndAnchor(ACharacter* Character,bool bTop) const
 {
  const float Radius=Character->GetCapsuleComponent()->GetScaledCapsuleRadius();
  const float HalfHeight=Character->GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
- FVector Anchor=GetActorTransform().TransformPosition(FVector(FMath::Max(StandOff,Radius+18),0,bTop?Height+FMath::Max(0.f,TopClearance):0));
+ FVector Anchor=GetActorTransform().TransformPosition(FVector(FMath::Max(StandOff,Radius+6),0,bTop?Height+FMath::Max(0.f,TopClearance):0));
  Anchor.Z+=HalfHeight+(bTop?8.f:4.f);
  return Anchor;
 }
