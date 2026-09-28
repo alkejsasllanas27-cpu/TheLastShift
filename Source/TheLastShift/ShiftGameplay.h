@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include "CoreMinimal.h"
 #include "GameFramework/Actor.h"
 #include "Subsystems/WorldSubsystem.h"
@@ -64,6 +64,8 @@ public:
  void SetBatteryVisible(bool Visible);
  /** Swaps the HUD for the death card the creature's grab ends on. */
  void ShowDeath();
+ /** The carried-items panel, shown while the player holds it open. */
+ void ShowInventory(const FString& Lines);
  void UpdateObjective(const FString& Objective);
 private:
  UPROPERTY() TObjectPtr<UTextBlock> ObjectiveText;
@@ -73,6 +75,7 @@ private:
  UPROPERTY() TObjectPtr<UTextBlock> StatusText;
  UPROPERTY() TObjectPtr<UTextBlock> NoteBody;
  UPROPERTY() TObjectPtr<UTextBlock> DeathText;
+ UPROPERTY() TObjectPtr<UTextBlock> InventoryText;
 };
 
 UCLASS()
@@ -117,7 +120,18 @@ public:
  UFUNCTION(BlueprintCallable) void PickUpFlashlight();
  /** Called by the creature when its grab lands: the HUD becomes the death card until the reload. */
  UFUNCTION(BlueprintCallable) void PlayerCaught();
+ /** Crouches or stands the player, the same path the crouch key drives. Standing needs headroom. */
+ UFUNCTION(BlueprintCallable) void SetCrouched(bool bValue);
+ UFUNCTION(BlueprintCallable) void ToggleInventory();
  UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Survival") bool bDead=false;
+ UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Survival") bool bCrouched=false;
+ UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Survival") bool bInventoryOpen=false;
+ /** Shoulder width while crouched: narrow enough to slip through the gaps a standing player cannot. */
+ UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Survival") float SqueezeRadius=16.f;
+ UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Survival") float CrouchedHalfHeight=52.f;
+ UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Survival") float CrouchSpeed=115.f;
+ /** Story items the player is carrying, newest last. */
+ UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Survival") TArray<FString> CarriedItems;
  UFUNCTION(BlueprintCallable) void EnterHiding(AShiftInteractable* Cabinet);
  UFUNCTION(BlueprintCallable) void ExitHiding();
  UFUNCTION(BlueprintCallable) void ReadNote(const FText& Text,FName StoryEvent);
@@ -144,6 +158,11 @@ private:
  bool BindPlayer();
  void UpdateFocus();
  FString Prompt() const;
+ /** Crouch narrows the capsule too, so tight gaps become passable; standing needs room above. */
+ void UpdateCrouch();
+ FString InventoryLines() const;
+ float StandRadius=34.f,StandHalfHeight=96.f,StandSpeed=500.f;
+ bool bCrouchLatched=false;
 };
 
 /** Starts the shared player interaction owner in gameplay worlds; no map rebuild. */

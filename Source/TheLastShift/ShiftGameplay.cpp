@@ -161,6 +161,11 @@ void UShiftPromptWidget::NativeOnInitialized()
  Add(T,FVector2D(0,-200),FVector2D(560,280),21);NoteBody=T;
  Add(T,FVector2D(36,36),FVector2D(450,65),15);ObjectiveText=T;
  auto* ObjectiveSlot=Cast<UCanvasPanelSlot>(T->Slot);ObjectiveSlot->SetAnchors(FAnchors(0,0));ObjectiveSlot->SetAlignment(FVector2D(0,0));T->SetJustification(ETextJustify::Left);
+ Add(T,FVector2D(36,-120),FVector2D(420,260),17);InventoryText=T;
+ {
+  auto* InventorySlot=Cast<UCanvasPanelSlot>(T->Slot);InventorySlot->SetAnchors(FAnchors(0,1));InventorySlot->SetAlignment(FVector2D(0,1));
+  T->SetJustification(ETextJustify::Left);T->SetVisibility(ESlateVisibility::Collapsed);
+ }
  Add(T,FVector2D(-36,-80),FVector2D(340,34),16);BatteryText=T;
  auto* BatterySlot=Cast<UCanvasPanelSlot>(T->Slot);BatterySlot->SetAnchors(FAnchors(1,1));BatterySlot->SetAlignment(FVector2D(1,1));T->SetJustification(ETextJustify::Right);
  BatteryBar=WidgetTree->ConstructWidget<UProgressBar>();auto* BarSlot=Canvas->AddChildToCanvas(BatteryBar);BarSlot->SetAnchors(FAnchors(1,1));BarSlot->SetAlignment(FVector2D(1,1));BarSlot->SetPosition(FVector2D(-36,-44));BarSlot->SetSize(FVector2D(170,5));
@@ -173,6 +178,12 @@ void UShiftPromptWidget::UpdateBattery(float Charge,int32 Spares,bool On)
  if(!BatteryText)return;Charge=FMath::Clamp(Charge,0.f,1.f);
  BatteryText->SetText(FText::FromString(FString::Printf(TEXT("FLASHLIGHT  %d%%  |  %s\nSPARES  %d / 3  ·  R REPLACE"),FMath::CeilToInt(Charge*100),On?TEXT("ON"):TEXT("OFF"),Spares)));
  FLinearColor Color=Charge<=.15f?FLinearColor(.9f,.25f,.12f):FLinearColor(.68f,.77f,.67f);BatteryBar->SetPercent(Charge);BatteryBar->SetFillColorAndOpacity(Color);
+}
+void UShiftPromptWidget::ShowInventory(const FString& Lines)
+{
+ if(!InventoryText)return;
+ InventoryText->SetText(FText::FromString(Lines));
+ InventoryText->SetVisibility(Lines.IsEmpty()?ESlateVisibility::Collapsed:ESlateVisibility::HitTestInvisible);
 }
 void UShiftPromptWidget::ShowDeath()
 {
@@ -190,6 +201,10 @@ bool AShiftDirector::BindPlayer()
  PC=UGameplayStatics::GetPlayerController(this,0);Player=PC?Cast<ACharacter>(PC->GetPawn()):nullptr;
  if(!Player||!PC->IsLocalController())return false;
  Flashlight=Player->FindComponentByClass<UFlashlightComponent>();
+ // Remember the standing shape and pace, so crouching can be undone exactly.
+ StandRadius=Player->GetCapsuleComponent()->GetUnscaledCapsuleRadius();
+ StandHalfHeight=Player->GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight();
+ StandSpeed=Player->GetCharacterMovement()->MaxWalkSpeed;
  Widget=CreateWidget<UShiftPromptWidget>(PC,UShiftPromptWidget::StaticClass());if(Widget)Widget->AddToViewport(20);
  // The two existing entrance controllers retain their animation graphs.
  for(TActorIterator<AActor> It(GetWorld());It;++It){AActor* A=*It;if(ActorValue(A,TEXT("LeftLeaf"))&&ActorValue(A,TEXT("RightLeaf"))){DoorControllers.Add(ActorValue(A,TEXT("LeftLeaf")),A);DoorControllers.Add(ActorValue(A,TEXT("RightLeaf")),A);}}
@@ -265,6 +280,9 @@ void AShiftDirector::Tick(float Dt)
   if(!ActiveLadder->IsClimbing())ActiveLadder=nullptr;
  }
  if(bPlayerHidden){FRotator R=PC->GetControlRotation();R.Yaw=HideFacing.Yaw+FMath::Clamp(FMath::FindDeltaAngleDegrees(HideFacing.Yaw,R.Yaw),-40.f,40.f);R.Pitch=FMath::Clamp(FRotator::NormalizeAxis(R.Pitch),-30.f,30.f);PC->SetControlRotation(R);if(Flashlight&&Flashlight->IsFlashlightOn())Flashlight->SetFlashlightOn(false);}
+ UpdateCrouch();
+ if(PC->WasInputKeyJustPressed(EKeys::Tab))bInventoryOpen=!bInventoryOpen;
+ if(Widget)Widget->ShowInventory(bInventoryOpen?InventoryLines():FString());
  TraceClock+=Dt;if(TraceClock>=.1f){TraceClock=0;UpdateFocus();}
  if(PC->WasInputKeyJustPressed(EKeys::E))Interact();
  if(PC->WasInputKeyJustPressed(EKeys::R)&&!bPlayerHidden&&!ActiveLadder&&Reading.IsEmpty())ReloadBattery();
@@ -292,9 +310,67 @@ void AShiftDirector::Interact()
 void AShiftDirector::Notify(const FString& Text,float Seconds){Status=Text;StatusUntil=GetWorld()->GetTimeSeconds()+Seconds;}
 void AShiftDirector::AddBattery(){SpareBatteries=FMath::Min(3,SpareBatteries+1);Notify(FString::Printf(TEXT("Battery collected  |  Spares: %d  |  R to replace"),SpareBatteries));}
 void AShiftDirector::PickUpFlashlight(){if(!Flashlight)return;Flashlight->GiveFlashlight();Notify(TEXT("Flashlight picked up  |  F to toggle"),5);}
-void AShiftDirector::PlayerCaught(){bDead=true;if(Widget)Widget->ShowDeath();}
+void AShiftDirector::PlayerCaught(){bDead=true;if(Widget){Widget->ShowInventory(FString());Widget->ShowDeath();}}
+
+void AShiftDirector::UpdateCrouch()
+{
+ // Ctrl holds the crouch, C latches it: crawling through a gap should not need a held key.
+ if(PC->WasInputKeyJustPressed(EKeys::C))bCrouchLatched=!bCrouchLatched;
+ SetCrouched(!bDead&&!bPlayerHidden&&!ActiveLadder&&(PC->IsInputKeyDown(EKeys::LeftControl)||bCrouchLatched));
+}
+void AShiftDirector::ToggleInventory(){bInventoryOpen=!bInventoryOpen;}
+void AShiftDirector::SetCrouched(bool bValue)
+{
+ if(!IsValid(Player)||!PC)return;
+ auto* Capsule=Player->GetCapsuleComponent();
+ auto* Movement=Player->GetCharacterMovement();
+ const bool bWants=bValue;
+ if(!bWants)bCrouchLatched=false;
+ if(bWants==bCrouched)return;
+ if(bWants)
+ {
+  bCrouched=true;
+  // Narrow shoulders as well as a lower head: this is what lets the player through the gaps.
+  Capsule->SetCapsuleSize(SqueezeRadius,CrouchedHalfHeight,true);
+  Movement->MaxWalkSpeed=CrouchSpeed;
+  return;
+ }
+ // Only stand back up where there is room for the full capsule, or the player pops into geometry.
+ const FVector Feet=Player->GetActorLocation()-FVector(0,0,Capsule->GetScaledCapsuleHalfHeight());
+ FCollisionQueryParams Params(SCENE_QUERY_STAT(ShiftStandUp),false,Player);
+ if(GetWorld()->OverlapBlockingTestByChannel(Feet+FVector(0,0,StandHalfHeight),FQuat::Identity,ECC_Pawn,FCollisionShape::MakeCapsule(StandRadius,StandHalfHeight),Params))
+ {
+  Notify(TEXT("No room to stand up"),1.5f);
+  return;
+ }
+ bCrouched=false;
+ Capsule->SetCapsuleSize(StandRadius,StandHalfHeight,true);
+ Player->SetActorLocation(Feet+FVector(0,0,StandHalfHeight),false,nullptr,ETeleportType::TeleportPhysics);
+ Movement->MaxWalkSpeed=StandSpeed;
+}
+
+FString AShiftDirector::InventoryLines() const
+{
+ TArray<FString> Lines;
+ Lines.Add(TEXT("CARRYING"));
+ if(Flashlight&&Flashlight->HasFlashlight())
+  Lines.Add(FString::Printf(TEXT("  Flashlight  ·  battery %d%%  ·  %s"),FMath::CeilToInt(Flashlight->BatteryCharge*100),Flashlight->IsFlashlightOn()?TEXT("on"):TEXT("off")));
+ else Lines.Add(TEXT("  (no flashlight)"));
+ Lines.Add(FString::Printf(TEXT("  Spare batteries  ·  %d / 3"),SpareBatteries));
+ for(const FString& Item:CarriedItems) Lines.Add(TEXT("  ")+Item);
+ Lines.Add(TEXT(""));
+ Lines.Add(TEXT("  TAB close  ·  R replace battery  ·  CTRL crouch"));
+ return FString::Join(Lines,TEXT("\n"));
+}
 void AShiftDirector::ReloadBattery(){if(!Flashlight)return;if(!Flashlight->HasFlashlight()){Notify(TEXT("You need a flashlight first"));return;}if(SpareBatteries<1){Notify(TEXT("No spare batteries"));return;}if(Flashlight->ReplaceBattery()){--SpareBatteries;Notify(FString::Printf(TEXT("Battery replaced  |  Spares: %d"),SpareBatteries));}else Notify(TEXT("Battery is already full"));}
-void AShiftDirector::ReadNote(const FText& Text,FName Event){Reading=Text.ToString();TriggerStory(Event);}
+void AShiftDirector::ReadNote(const FText& Text,FName Event)
+{
+ Reading=Text.ToString();
+ // Paper the player has read stays listed in the inventory, so the story items are countable.
+ const FString Label=Event==TEXT("NightShiftEvidence")?TEXT("Reception log"):Event==TEXT("MaintenanceEvidence")?TEXT("Maintenance record"):FString();
+ if(!Label.IsEmpty())CarriedItems.AddUnique(Label);
+ TriggerStory(Event);
+}
 void AShiftDirector::EnterHiding(AShiftInteractable* Cabinet)
 {
  if(!Player||!Cabinet||Cabinet->bOccupied)return;
