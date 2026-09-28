@@ -21,6 +21,7 @@
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/GameModeBase.h"
 #include "Components/CapsuleComponent.h"
 #include "Kismet/GameplayStatics.h"
 #include "EngineUtils.h"
@@ -152,7 +153,10 @@ void UShiftPromptWidget::NativeOnInitialized()
  AimSlot->SetAlignment(FVector2D(.5f,.5f));AimSlot->SetPosition(FVector2D::ZeroVector);AimSlot->SetSize(FVector2D(5,5));
 
  auto Add=[&](UTextBlock*& Text,FVector2D Pos,FVector2D Size,int32 Font){Text=WidgetTree->ConstructWidget<UTextBlock>();Text->SetFont(FSlateFontInfo(FCoreStyle::GetDefaultFontStyle("Regular",Font)));Text->SetColorAndOpacity(FSlateColor(FLinearColor(.85f,.85f,.80f)));Text->SetShadowColorAndOpacity(FLinearColor(0,0,0,.9f));Text->SetShadowOffset(FVector2D(1,1));Text->SetJustification(ETextJustify::Center);Text->SetAutoWrapText(true);auto* Slot=Canvas->AddChildToCanvas(Text);Slot->SetAnchors(FAnchors(.5f,.5f));Slot->SetAlignment(FVector2D(.5f,0));Slot->SetPosition(Pos);Slot->SetSize(Size);};
- UTextBlock* T=nullptr;Add(T,FVector2D(0,95),FVector2D(450,45),16);PromptText=T;
+ UTextBlock* T=nullptr;Add(T,FVector2D(0,-60),FVector2D(700,120),64);DeathText=T;
+ DeathText->SetColorAndOpacity(FSlateColor(FLinearColor(.62f,.04f,.03f)));
+ DeathText->SetText(FText::FromString(TEXT("YOU DIED")));DeathText->SetVisibility(ESlateVisibility::Collapsed);
+ Add(T,FVector2D(0,95),FVector2D(450,45),16);PromptText=T;
  Add(T,FVector2D(0,140),FVector2D(550,65),15);StatusText=T;
  Add(T,FVector2D(0,-200),FVector2D(560,280),21);NoteBody=T;
  Add(T,FVector2D(36,36),FVector2D(450,65),15);ObjectiveText=T;
@@ -170,6 +174,13 @@ void UShiftPromptWidget::UpdateBattery(float Charge,int32 Spares,bool On)
  BatteryText->SetText(FText::FromString(FString::Printf(TEXT("FLASHLIGHT  %d%%  |  %s\nSPARES  %d / 3  ·  R REPLACE"),FMath::CeilToInt(Charge*100),On?TEXT("ON"):TEXT("OFF"),Spares)));
  FLinearColor Color=Charge<=.15f?FLinearColor(.9f,.25f,.12f):FLinearColor(.68f,.77f,.67f);BatteryBar->SetPercent(Charge);BatteryBar->SetFillColorAndOpacity(Color);
 }
+void UShiftPromptWidget::ShowDeath()
+{
+ // Everything else goes: no prompt, no objective, no battery behind the card.
+ for(UTextBlock* Text : {PromptText.Get(),StatusText.Get(),NoteBody.Get(),ObjectiveText.Get()}) if(Text) Text->SetText(FText::GetEmpty());
+ SetBatteryVisible(false);
+ if(DeathText) DeathText->SetVisibility(ESlateVisibility::HitTestInvisible);
+}
 void UShiftPromptWidget::SetBatteryVisible(bool Visible){const ESlateVisibility V=Visible?ESlateVisibility::HitTestInvisible:ESlateVisibility::Collapsed;if(BatteryText)BatteryText->SetVisibility(V);if(BatteryBar)BatteryBar->SetVisibility(V);}
 void UShiftPromptWidget::UpdateObjective(const FString& Objective){if(ObjectiveText)ObjectiveText->SetText(FText::FromString(Objective));}
 
@@ -184,6 +195,16 @@ bool AShiftDirector::BindPlayer()
  for(TActorIterator<AActor> It(GetWorld());It;++It){AActor* A=*It;if(ActorValue(A,TEXT("LeftLeaf"))&&ActorValue(A,TEXT("RightLeaf"))){DoorControllers.Add(ActorValue(A,TEXT("LeftLeaf")),A);DoorControllers.Add(ActorValue(A,TEXT("RightLeaf")),A);}}
  // A narrow query surface lets the camera target barred leaves through their gaps.
  for(const auto& Entry:DoorControllers){AActor* Leaf=Entry.Key;FBox B=Leaf->CalculateComponentsBoundingBoxInLocalSpace();auto* Target=NewObject<UBoxComponent>(Leaf);Target->SetupAttachment(Leaf->GetRootComponent());Target->SetRelativeLocation(B.GetCenter());Target->SetBoxExtent(B.GetExtent().ComponentMax(FVector(3)));Target->SetCollisionEnabled(ECollisionEnabled::QueryOnly);Target->SetCollisionResponseToAllChannels(ECR_Ignore);Target->SetCollisionResponseToChannel(ECC_Visibility,ECR_Block);Target->RegisterComponent();}
+ // A death restart reloads with ?checkpoint=entrance: the night resumes at the hospital door,
+ // flashlight in hand, rather than sending the player back down the forest road.
+ const AGameModeBase* Mode=UGameplayStatics::GetGameMode(this);
+ if(Mode&&UGameplayStatics::ParseOption(Mode->OptionsString,TEXT("checkpoint"))==TEXT("entrance"))
+ {
+  Player->SetActorLocationAndRotation(FVector(-5050,2000,1470),FRotator::ZeroRotator,false,nullptr,ETeleportType::TeleportPhysics);
+  PC->SetControlRotation(FRotator::ZeroRotator);
+  if(Flashlight)Flashlight->GiveFlashlight();
+  Notify(TEXT("It let you go. You are back at the hospital door."),6);
+ }
  if(GetWorld()->WorldType==EWorldType::Game)ToggleMenu();
  return true;
 }
@@ -235,6 +256,7 @@ FString AShiftDirector::Prompt()const
 void AShiftDirector::Tick(float Dt)
 {
  Super::Tick(Dt);if(!IsValid(Player)){if(!BindPlayer())return;}
+ if(bDead)return;
  if(!IsValid(Flashlight))Flashlight=Player->FindComponentByClass<UFlashlightComponent>();
  if(PC->WasInputKeyJustPressed(EKeys::P)||(GetWorld()->WorldType!=EWorldType::PIE&&PC->WasInputKeyJustPressed(EKeys::Escape)))ToggleMenu();
  if(bMenuOpen)return;
@@ -270,6 +292,7 @@ void AShiftDirector::Interact()
 void AShiftDirector::Notify(const FString& Text,float Seconds){Status=Text;StatusUntil=GetWorld()->GetTimeSeconds()+Seconds;}
 void AShiftDirector::AddBattery(){SpareBatteries=FMath::Min(3,SpareBatteries+1);Notify(FString::Printf(TEXT("Battery collected  |  Spares: %d  |  R to replace"),SpareBatteries));}
 void AShiftDirector::PickUpFlashlight(){if(!Flashlight)return;Flashlight->GiveFlashlight();Notify(TEXT("Flashlight picked up  |  F to toggle"),5);}
+void AShiftDirector::PlayerCaught(){bDead=true;if(Widget)Widget->ShowDeath();}
 void AShiftDirector::ReloadBattery(){if(!Flashlight)return;if(!Flashlight->HasFlashlight()){Notify(TEXT("You need a flashlight first"));return;}if(SpareBatteries<1){Notify(TEXT("No spare batteries"));return;}if(Flashlight->ReplaceBattery()){--SpareBatteries;Notify(FString::Printf(TEXT("Battery replaced  |  Spares: %d"),SpareBatteries));}else Notify(TEXT("Battery is already full"));}
 void AShiftDirector::ReadNote(const FText& Text,FName Event){Reading=Text.ToString();TriggerStory(Event);}
 void AShiftDirector::EnterHiding(AShiftInteractable* Cabinet)

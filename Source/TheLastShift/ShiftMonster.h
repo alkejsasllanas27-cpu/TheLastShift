@@ -26,6 +26,16 @@ public:
  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Animation") TObjectPtr<UAnimSequence> IdleAnimation;
  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Horror") float DetectionDistance=2400.f;
  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Horror") float ChaseSpeed=235.f;
+ /** How far from its post it wanders while nothing has been seen or heard. */
+ UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Horror") float PatrolRadius=1100.f;
+ /** Walking pace while patrolling; the chase is what should sound different. */
+ UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Horror") float PatrolSpeed=95.f;
+ /** A running player is heard this far away even through a wall; walking is silent to it. */
+ UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Horror") float HearingRadius=1500.f;
+ /** Speed above which the player counts as running, and is heard. */
+ UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Horror") float HearingSpeed=330.f;
+ /** How long it keeps searching around the last place the player was seen or heard. */
+ UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Horror") float SearchSeconds=10.f;
  /** Reach of the grab: once the player is this close the jumpscare starts and the run is over. */
  UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Horror") float CatchDistance=165.f;
  /** How long the creature is held in the player's face before the screen fades and the game restarts. */
@@ -49,6 +59,12 @@ private:
  FVector VisualOrigin=FVector::ZeroVector;
  FVector LastSeen=FVector::ZeroVector;
  float Memory=0.f, ScreamCooldown=0.f, FreezeTime=0.f, GrowlCooldown=5.f, Age=0.f;
+ FVector HomeLocation=FVector::ZeroVector, PatrolTarget=FVector::ZeroVector;
+ float PatrolPause=0.f, SearchTime=0.f;
+ /** Wanders around its post and investigates noises; returns true while it has somewhere to be. */
+ void Prowl(APawn* Target, float Dt);
+ /** Picks a spot within PatrolRadius that has floor under it. */
+ void ChoosePatrolTarget();
  float CatchTime=0.f;
  bool bFadeStarted=false, bRestartRequested=false;
  bool CanSee(APawn* Target) const;

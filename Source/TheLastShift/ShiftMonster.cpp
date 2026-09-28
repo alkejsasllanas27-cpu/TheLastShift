@@ -1,5 +1,7 @@
 ﻿#include "ShiftMonster.h"
+#include "ShiftGameplay.h"
 #include "AIController.h"
+#include "EngineUtils.h"
 #include "Components/StaticMeshComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimSequence.h"
@@ -102,7 +104,8 @@ void AShiftMonster::BeginPlay()
  Super::BeginPlay();
  VisualOrigin=GetMesh()->GetRelativeLocation();
  if(IdleAnimation) GetMesh()->PlayAnimation(IdleAnimation,true);
- GetCharacterMovement()->MaxWalkSpeed=ChaseSpeed;
+ HomeLocation=GetActorLocation();PatrolTarget=HomeLocation;PatrolPause=FMath::FRandRange(1.f,4.f);
+ GetCharacterMovement()->MaxWalkSpeed=PatrolSpeed;
  if(!Controller) SpawnDefaultController();
 }
 
@@ -147,10 +150,60 @@ void AShiftMonster::Roar()
  }
 }
 
+void AShiftMonster::ChoosePatrolTarget()
+{
+ for(int32 Attempt=0;Attempt<8;++Attempt)
+ {
+  const float Angle=FMath::FRandRange(0.f,2.f*PI);
+  const float Distance=FMath::FRandRange(PatrolRadius*.35f,PatrolRadius);
+  const FVector Candidate=HomeLocation+FVector(FMath::Cos(Angle),FMath::Sin(Angle),0)*Distance;
+  FHitResult Floor;
+  FCollisionQueryParams Params(SCENE_QUERY_STAT(MonsterPatrol),false,this);
+  if(GetWorld()->LineTraceSingleByChannel(Floor,Candidate+FVector(0,0,150.f),Candidate-FVector(0,0,400.f),ECC_Visibility,Params) && Floor.ImpactNormal.Z>.7f)
+  {
+   PatrolTarget=Floor.ImpactPoint+FVector(0,0,GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight());
+   return;
+  }
+ }
+ PatrolTarget=HomeLocation;
+}
+
+void AShiftMonster::Prowl(APawn* Target, float Dt)
+{
+ GetCharacterMovement()->MaxWalkSpeed=PatrolSpeed;
+ // A running player is heard through walls; walking leaves it to its rounds.
+ if(SearchTime<=0.f && Target->GetVelocity().Size2D()>HearingSpeed)
+ {
+  const float Noise=(Target->GetActorLocation()-GetActorLocation()).Size();
+  if(Noise<HearingRadius){LastSeen=Target->GetActorLocation();SearchTime=SearchSeconds;}
+ }
+ FVector Goal=PatrolTarget;
+ if(SearchTime>0.f)
+ {
+  SearchTime-=Dt;
+  Goal=LastSeen;
+  // Once it arrives at the noise it casts about for a moment before going back to its rounds.
+  if((LastSeen-GetActorLocation()).Size2D()<170.f) SearchTime=FMath::Min(SearchTime,2.5f);
+  if(SearchTime<=0.f) ChoosePatrolTarget();
+ }
+ else if(PatrolPause>0.f){PatrolPause-=Dt;GetCharacterMovement()->StopMovementImmediately();return;}
+ else if(PatrolTarget.IsNearlyZero()||(PatrolTarget-GetActorLocation()).Size2D()<140.f)
+ {
+  ChoosePatrolTarget();PatrolPause=FMath::FRandRange(2.5f,6.f);return;
+ }
+ const FVector Desired=(Goal-GetActorLocation()).GetSafeNormal2D();
+ if(Desired.IsNearlyZero())return;
+ SetActorRotation(FMath::RInterpTo(GetActorRotation(),Desired.Rotation(),Dt,2.5f));
+ const FVector Move=Steer(Desired,Target);
+ if(Move.IsNearlyZero()){ChoosePatrolTarget();PatrolPause=1.f;return;}
+ AddMovementInput(Move,1.f);
+}
+
 void AShiftMonster::CatchPlayer(APawn* Target)
 {
  if(bCaughtPlayer) return;
  bCaughtPlayer=true;CatchTime=0.f;++AttackCount;
+ for(TActorIterator<AShiftDirector> It(GetWorld());It;++It){It->PlayerCaught();break;}
  ScreamCooldown=0.f;Roar();
  // A second, unspatialised copy of the scream: the spatialised one alone is too polite for a grab.
  if(Scream) UGameplayStatics::PlaySound2D(this,Scream,1.6f,FMath::FRandRange(.94f,1.02f));
@@ -216,8 +269,9 @@ void AShiftMonster::JumpscareTick(APawn* Target, float Dt)
  if(!bRestartRequested && CatchTime>=JumpscareSeconds)
  {
   bRestartRequested=true;
-  // Straight back to the start of the night: a fresh level reload resets progress, pickups and the flashlight.
-  UGameplayStatics::OpenLevel(this,FName(*UGameplayStatics::GetCurrentLevelName(this,true)));
+  // A fresh level reload clears progress, pickups and the creature; the checkpoint option puts
+  // the player back at the hospital door with a flashlight instead of out in the forest.
+  UGameplayStatics::OpenLevel(this,FName(*UGameplayStatics::GetCurrentLevelName(this,true)),true,TEXT("checkpoint=entrance"));
  }
 }
 
@@ -239,7 +293,8 @@ void AShiftMonster::Tick(float Dt)
   if(!bChasing){bChasing=true;FreezeTime=.65f;Roar();}
  }
  else Memory-=Dt;
- if(Memory<=0.f) bChasing=false;
+ // Losing sight does not end it: the last place the player stood is worth searching.
+ if(Memory<=0.f&&bChasing){bChasing=false;SearchTime=SearchSeconds;}
  if(bChasing)
  {
   const FVector Desired=(LastSeen-GetActorLocation()).GetSafeNormal2D();
@@ -258,6 +313,7 @@ void AShiftMonster::Tick(float Dt)
   if(GrowlCooldown<=0.f && !Voice->IsPlaying() && Growl)
   {Voice->SetSound(Growl);Voice->SetPitchMultiplier(FMath::FRandRange(.85f,1.f));Voice->Play();GrowlCooldown=FMath::FRandRange(5.f,8.f);}
  }
+ else if(FreezeTime<=0.f) Prowl(Target,Dt);
  const float Speed=GetVelocity().Size2D();
  const bool ShouldWalk=Speed>8.f;
  if(ShouldWalk!=bWalkingAnimation)

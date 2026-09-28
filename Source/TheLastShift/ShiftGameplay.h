@@ -62,6 +62,8 @@ public:
  void Show(const FString& Prompt,const FString& Status,const FString& Note);
  void UpdateBattery(float Charge,int32 Spares,bool On);
  void SetBatteryVisible(bool Visible);
+ /** Swaps the HUD for the death card the creature's grab ends on. */
+ void ShowDeath();
  void UpdateObjective(const FString& Objective);
 private:
  UPROPERTY() TObjectPtr<UTextBlock> ObjectiveText;
@@ -70,6 +72,7 @@ private:
  UPROPERTY() TObjectPtr<UTextBlock> PromptText;
  UPROPERTY() TObjectPtr<UTextBlock> StatusText;
  UPROPERTY() TObjectPtr<UTextBlock> NoteBody;
+ UPROPERTY() TObjectPtr<UTextBlock> DeathText;
 };
 
 UCLASS()
@@ -112,6 +115,9 @@ public:
  UFUNCTION(BlueprintCallable) void ReloadBattery();
  UFUNCTION(BlueprintCallable) void AddBattery();
  UFUNCTION(BlueprintCallable) void PickUpFlashlight();
+ /** Called by the creature when its grab lands: the HUD becomes the death card until the reload. */
+ UFUNCTION(BlueprintCallable) void PlayerCaught();
+ UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category="Survival") bool bDead=false;
  UFUNCTION(BlueprintCallable) void EnterHiding(AShiftInteractable* Cabinet);
  UFUNCTION(BlueprintCallable) void ExitHiding();
  UFUNCTION(BlueprintCallable) void ReadNote(const FText& Text,FName StoryEvent);
