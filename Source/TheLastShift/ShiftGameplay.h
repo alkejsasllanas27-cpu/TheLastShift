@@ -142,7 +142,50 @@ public:
  UPROPERTY(VisibleAnywhere,BlueprintReadOnly) bool bMenuOpen=false;
  UPROPERTY(VisibleAnywhere,BlueprintReadOnly,Category="Story") int32 ObjectiveStage=0;
  UPROPERTY(VisibleAnywhere,BlueprintReadOnly,Category="Traversal") TObjectPtr<AShiftLadder> ActiveLadder;
+ /** Seconds a hinged door takes to swing. Matches the creak: after ~2.2 s it is only reverb fading out. */
+ UPROPERTY(EditAnywhere,BlueprintReadWrite,Category="Doors") float DoorSwingSeconds=2.2f;
+ UPROPERTY(EditAnywhere,BlueprintReadWrite,Category="Doors") TObjectPtr<USoundBase> DoorCreakSound;
+ /** Played when a closing door reaches the frame. */
+ UPROPERTY(EditAnywhere,BlueprintReadWrite,Category="Doors") TObjectPtr<USoundBase> DoorLatchSound;
+ UPROPERTY(EditAnywhere,BlueprintReadWrite,Category="Doors") float DoorVolume=.8f;
+ /**
+  * Exposure bias the flashlight was tuned at, inside the hospital and outside. Where an area runs a different
+  * exposure (the interiors are darker), the beam is scaled so it still looks the way it was tuned.
+  */
+ UPROPERTY(EditAnywhere,BlueprintReadWrite,Category="Lighting") float FlashlightInteriorReferenceBias=9.5f;
+ UPROPERTY(EditAnywhere,BlueprintReadWrite,Category="Lighting") float FlashlightOutdoorReferenceBias=10.1f;
+ /** Opens or closes a hinged door (an actor with bIsOpen and OpenAngle), eased and timed to its creak. Double doors go together. */
+ UFUNCTION(BlueprintCallable) void SwingDoor(AActor* Door);
 private:
+ /**
+  * The hospital doors' actor origin is the building's origin (every door of a wing shares it), so
+  * turning the actor swings the leaf metres away. A door turns around its real hinge edge instead:
+  * the level tags each door "Hinge.Min"/"Hinge.Max" (the edge away from its handle, or the outer edge
+  * of a double door) and "DoorPair.<actor name>" for the other leaf of a double door.
+  */
+ struct FDoorHinge{FVector Pivot=FVector::ZeroVector;FVector ClosedLocation=FVector::ZeroVector;FQuat ClosedRotation=FQuat::Identity;FTransform ClosedLeaf;float Angle=0;bool bHingeAtMin=true;};
+ /** From/To are angles around the hinge: 0 is closed, +-OpenAngle open. */
+ struct FDoorSwing{TWeakObjectPtr<AActor> Door;float From=0,To=0,Elapsed=0,Duration=1;bool bClosing=false;};
+ TArray<FDoorSwing> DoorSwings;
+ /** Each hinged door's closed pose and hinge, worked out the first time it is used. */
+ TMap<TWeakObjectPtr<AActor>,FDoorHinge> DoorHinges;
+ FDoorHinge FindHinge(AActor* Door,UStaticMeshComponent* Leaf,float OpenAngle) const;
+ /** Whether the leaf, turned to Angle, would run into a wall (the half by the hinge is ignored: it touches the frame anyway). */
+ bool DoorPoseBlocked(AActor* Door,UStaticMeshComponent* Leaf,const FTransform& ClosedLeaf,const FVector& Pivot,bool bHingeAtMin,float Angle) const;
+ void SetDoorAngle(AActor* Door,FDoorHinge& Hinge,float Angle);
+ void SwingOne(AActor* Door,bool bPlaySound);
+ AActor* DoorPartner(AActor* Door) const;
+ void UpdateDoors(float Dt);
+ /** Leaves that let the player pass while they move, with the pawn response to put back once the player is clear. */
+ TMap<TWeakObjectPtr<UPrimitiveComponent>,TEnumAsByte<ECollisionResponse>> DoorsIgnoringPawn;
+ /** The player input component whose old Blueprint E binding (the asset pack's door snap) has been removed. */
+ TWeakObjectPtr<UObject> InteractBindingCleared;
+ /** Rain around the player, told each frame whether there is a roof overhead. */
+ UPROPERTY() TObjectPtr<class AShiftRain> Rain;
+ /** The hospital's bounded exposure volumes, and the unbounded outdoor one. */
+ TArray<TWeakObjectPtr<class APostProcessVolume>> InteriorVolumes;
+ TWeakObjectPtr<class APostProcessVolume> OutdoorVolume;
+ void UpdateWeatherAndExposure(float Dt);
  UPROPERTY() TObjectPtr<UShiftMenuWidget> Menu;
  UPROPERTY() TObjectPtr<ACharacter> Player;
  UPROPERTY() TObjectPtr<APlayerController> PC;

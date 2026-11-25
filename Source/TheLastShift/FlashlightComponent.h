@@ -10,6 +10,7 @@ class UPointLightComponent;
 class USkeletalMeshComponent;
 class UInputAction;
 class UInputMappingContext;
+class USoundBase;
 
 /**
  * Self-contained handheld flashlight: owns its own mesh + spotlight as a rigid
@@ -151,6 +152,54 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Beam", meta = (ClampMin = "0", ClampMax = "1"))
 	float BeamOriginTowardEye = 0.75f;
 
+	/**
+	 * How quickly the beam catches up with camera turns. A little lag gives the light the weight of
+	 * a hand-held torch; higher is tighter, 0 locks it rigidly to the view.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Beam", meta = (ClampMin = "0"))
+	float BeamLagSpeed = 18.f;
+
+	/** Wide, dim halo around the hotspot -- the spill ring of a real flashlight. Placed and aimed with the beam. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Flashlight|Beam")
+	TObjectPtr<USpotLightComponent> SpillLight;
+
+	/** Spill brightness as a fraction of the main beam's. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Beam", meta = (ClampMin = "0", ClampMax = "1"))
+	float SpillIntensityRatio = 0.3f;
+
+	/**
+	 * Soft light at whatever the beam hits, standing in for the light that would bounce back off it:
+	 * the project runs without dynamic GI, so without it everything outside the beam stays pitch black.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Flashlight|Bounce")
+	TObjectPtr<UPointLightComponent> BounceLight;
+
+	/** Candelas of the bounce when the beam hits something right in front of the player; it fades with distance. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Bounce", meta = (ClampMin = "0"))
+	float BounceIntensity = 12.f;
+
+	/** Beyond this distance (cm) from the flashlight there is no bounce. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Bounce", meta = (ClampMin = "100"))
+	float BounceMaxDistance = 2000.f;
+
+	/** How far (cm) off the lit surface the bounce sits, so it spreads over the surface instead of a hot dot. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Bounce", meta = (ClampMin = "0"))
+	float BounceSurfaceOffset = 30.f;
+
+	/**
+	 * Multiplies beam, spill and bounce. The game sets it from the exposure of the area the player is in, so the
+	 * flashlight looks the same in the darker hospital interiors as it does outside.
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadWrite, Category = "Flashlight|Beam")
+	float ExposureCompensation = 1.f;
+
+	/** Click played when the switch is pressed (defaults to SFX_FlashlightClick). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Sound")
+	TObjectPtr<USoundBase> ToggleSound;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Flashlight|Sound", meta = (ClampMin = "0"))
+	float ToggleVolume = 0.5f;
+
 	/** Flips the flashlight between on and off. Safe to call from Blueprint or other C++ systems. */
 	UFUNCTION(BlueprintCallable, Category = "Flashlight")
 	void ToggleFlashlight();
@@ -175,6 +224,14 @@ public:
 	float BatteryRuntimeSeconds = 600.f;
 	UFUNCTION(BlueprintCallable, Category="Flashlight|Battery")
 	bool ReplaceBattery();
+
+	/** Below this charge the beam dims, turns warmer and stutters every few seconds. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flashlight|Battery", meta=(ClampMin="0", ClampMax="1"))
+	float LowBatteryThreshold = 0.2f;
+
+	/** Brightness left just before the battery dies, as a fraction of full. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category="Flashlight|Battery", meta=(ClampMin="0", ClampMax="1"))
+	float LowBatteryMinBrightness = 0.45f;
 
 protected:
 	virtual void OnRegister() override;
@@ -210,6 +267,31 @@ private:
 
 	/** Smoothed distance to the crosshair target the beam converges on; 0 until first aimed. */
 	float SmoothedConvergeDistance = 0.f;
+
+	/** Lagged beam direction (see BeamLagSpeed). */
+	FQuat SmoothedBeamQuat = FQuat::Identity;
+	bool bBeamPlaced = false;
+
+	/** Where the bounce light is easing toward, and how strong it should be (0..1 of BounceIntensity). */
+	FVector BounceTarget = FVector::ZeroVector;
+	float BounceStrength = 0.f;
+	bool bBouncePlaced = false;
+
+	/** Beam brightness and colour as authored, captured at BeginPlay; battery and flicker scale from these. */
+	float BaseBeamIntensity = 0.f;
+	float BaseBeamTemperature = 6500.f;
+
+	/** Seconds since the switch was pressed on, for the start-up stutter; negative once it has settled. */
+	float SwitchOnTime = -1.f;
+
+	/** Weak-battery stutter: time until the next burst, time left in the current one, and its current level. */
+	float FlickerCooldown = 0.f;
+	float FlickerRemaining = 0.f;
+	float FlickerStepTimer = 0.f;
+	float FlickerValue = 1.f;
+
+	/** Applies switch-on stutter, battery dimming and flicker to all three lights. */
+	void UpdateBrightness(float DeltaTime);
 
 	/** Lagged world rotation of the held flashlight in viewmodel placement. */
 	FQuat ViewmodelQuat = FQuat::Identity;

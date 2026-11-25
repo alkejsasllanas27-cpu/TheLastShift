@@ -11,6 +11,9 @@
 #include "InputAction.h"
 #include "InputMappingContext.h"
 #include "Kismet/KismetSystemLibrary.h"
+#include "Kismet/GameplayStatics.h"
+#include "Sound/SoundBase.h"
+#include "UObject/ConstructorHelpers.h"
 #include "Engine/World.h"
 
 // Where the beam leaves the flashlight mesh, in the mesh's local space.
@@ -45,6 +48,9 @@ UFlashlightComponent::UFlashlightComponent()
 	ViewmodelFill->LightingChannels.bChannel1 = true;
 	ViewmodelFill->SetLightColor(FLinearColor(1.f, .9f, .8f));
 	ViewmodelFill->Mobility = EComponentMobility::Movable;
+	// Volumetric fog ignores lighting channels: sitting right in front of the camera, this light
+	// lit the hospital's dense fog and washed the whole view out white.
+	ViewmodelFill->VolumetricScatteringIntensity = 0.f;
 	ViewmodelFill->SetVisibility(false);
 
 	// Attached to the mesh (not to this component) so it follows the flashlight when
@@ -64,7 +70,51 @@ UFlashlightComponent::UFlashlightComponent()
 	SpotLight->SourceRadius = 1.f;
 	SpotLight->bUseInverseSquaredFalloff = true;
 	SpotLight->Mobility = EComponentMobility::Movable;
+	// The fog in the hospital is dense enough that any scattering from the beam turns into a white wall.
+	SpotLight->VolumetricScatteringIntensity = 0.f;
+	// Screen-space contact shadows add the small, crisp shadows a hard torch throws close up.
+	SpotLight->ContactShadowLength = 0.03f;
 	SpotLight->SetVisibility(false);
+
+	SpillLight = CreateDefaultSubobject<USpotLightComponent>(TEXT("SpillLight"));
+	SpillLight->SetupAttachment(FlashlightMesh);
+	SpillLight->SetRelativeLocation(FlashlightLensOffset);
+	SpillLight->IntensityUnits = ELightUnits::Lumens;
+	SpillLight->Intensity = 0.f; // set every tick from the beam's brightness
+	SpillLight->InnerConeAngle = 22.f;
+	SpillLight->OuterConeAngle = 58.f;
+	SpillLight->AttenuationRadius = 2200.f;
+	SpillLight->bUseTemperature = true;
+	SpillLight->CastShadows = true;
+	SpillLight->SourceRadius = 2.f;
+	SpillLight->bUseInverseSquaredFalloff = true;
+	SpillLight->VolumetricScatteringIntensity = 0.f;
+	SpillLight->bAffectTranslucentLighting = false;
+	SpillLight->Mobility = EComponentMobility::Movable;
+	SpillLight->SetVisibility(false);
+
+	// Placed in world space every tick (see UpdateAimedTransform), not carried by the hand.
+	BounceLight = CreateDefaultSubobject<UPointLightComponent>(TEXT("BounceLight"));
+	BounceLight->SetupAttachment(this);
+	BounceLight->SetUsingAbsoluteLocation(true);
+	BounceLight->SetUsingAbsoluteRotation(true);
+	BounceLight->IntensityUnits = ELightUnits::Candelas;
+	BounceLight->Intensity = 0.f;
+	BounceLight->AttenuationRadius = 420.f;
+	BounceLight->SourceRadius = 30.f;
+	BounceLight->SoftSourceRadius = 60.f;
+	BounceLight->SetLightColor(FLinearColor(1.f, .94f, .86f));
+	BounceLight->CastShadows = false;
+	BounceLight->VolumetricScatteringIntensity = 0.f;
+	BounceLight->bAffectTranslucentLighting = false;
+	BounceLight->Mobility = EComponentMobility::Movable;
+	BounceLight->SetVisibility(false);
+
+	static ConstructorHelpers::FObjectFinder<USoundBase> ClickSound(TEXT("/Game/ShiftAssets/Audio/SFX_FlashlightClick.SFX_FlashlightClick"));
+	if (ClickSound.Succeeded())
+	{
+		ToggleSound = ClickSound.Object;
+	}
 }
 
 void UFlashlightComponent::OnRegister()
@@ -84,6 +134,13 @@ void UFlashlightComponent::BeginPlay()
 	TryAttachToHand(/*bRequireTargetRegistered=*/false);
 
 	DisableLegacyFlashlightComponents();
+
+	// The beam's brightness and colour are authored on the Blueprint; dimming, flicker and the
+	// spill all work relative to them, so a later tweak there carries through.
+	BaseBeamIntensity = SpotLight->Intensity;
+	BaseBeamTemperature = SpotLight->bUseTemperature ? SpotLight->Temperature : 6500.f;
+	SpillLight->SetIntensityUnits(SpotLight->IntensityUnits);
+	SpillLight->SetAttenuationRadius(SpotLight->AttenuationRadius * 0.8f);
 
 	SetFlashlightOn(bStartsOn);
 
@@ -323,6 +380,7 @@ void UFlashlightComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 	TryAttachToHand(/*bRequireTargetRegistered=*/false);
 
 	UpdateAimedTransform(DeltaTime);
+	UpdateBrightness(DeltaTime);
 }
 
 void UFlashlightComponent::UpdateAimedTransform(float DeltaTime)
@@ -389,8 +447,7 @@ void UFlashlightComponent::UpdateAimedTransform(float DeltaTime)
 		TargetDistance = Hit.Distance;
 	}
 	TargetDistance = FMath::Max(TargetDistance, BeamConvergeMinDistance);
-	// Only the distance is smoothed, never the direction, so the beam never trails the view
-	// when turning -- it just doesn't pop when the crosshair slides off an edge.
+	// The distance is smoothed so the beam doesn't pop when the crosshair slides off an edge.
 	SmoothedConvergeDistance = SmoothedConvergeDistance <= 0.f
 		? TargetDistance
 		: FMath::FInterpTo(SmoothedConvergeDistance, TargetDistance, DeltaTime, BeamConvergeInterpSpeed);
@@ -398,7 +455,102 @@ void UFlashlightComponent::UpdateAimedTransform(float DeltaTime)
 	const FVector LensLocation = FlashlightMesh->GetComponentTransform().TransformPosition(FlashlightLensOffset);
 	const FVector BeamOrigin = FMath::Lerp(LensLocation, CameraLocation, BeamOriginTowardEye);
 	const FVector AimPoint = CameraLocation + CameraForward * SmoothedConvergeDistance;
-	SpotLight->SetWorldLocationAndRotation(BeamOrigin, (AimPoint - BeamOrigin).ToOrientationQuat());
+
+	// The direction trails the view only slightly (BeamLagSpeed): enough to feel like a torch in a
+	// hand, still tight enough that the hotspot stays on the crosshair once the view settles.
+	const FQuat TargetBeamQuat = (AimPoint - BeamOrigin).ToOrientationQuat();
+	SmoothedBeamQuat = (bBeamPlaced && BeamLagSpeed > 0.f)
+		? FQuat::Slerp(SmoothedBeamQuat, TargetBeamQuat, 1.f - FMath::Exp(-BeamLagSpeed * DeltaTime))
+		: TargetBeamQuat;
+	bBeamPlaced = true;
+	SpotLight->SetWorldLocationAndRotation(BeamOrigin, SmoothedBeamQuat);
+	SpillLight->SetWorldLocationAndRotation(BeamOrigin, SmoothedBeamQuat);
+
+	// Bounce: a soft light just off whatever the beam lands on, fading the further away that is.
+	const FVector BeamDirection = SmoothedBeamQuat.GetForwardVector();
+	FHitResult BeamHit;
+	if (GetWorld()->LineTraceSingleByChannel(BeamHit, BeamOrigin, BeamOrigin + BeamDirection * BounceMaxDistance, ECC_Visibility, QueryParams))
+	{
+		BounceTarget = BeamHit.ImpactPoint + BeamHit.ImpactNormal * BounceSurfaceOffset;
+		BounceStrength = FMath::Square(1.f - BeamHit.Distance / BounceMaxDistance);
+	}
+	else
+	{
+		BounceStrength = 0.f;
+	}
+	// Eased rather than snapped, so sweeping the beam across edges doesn't make the room flicker.
+	const FVector BounceLocation = bBouncePlaced
+		? FMath::VInterpTo(BounceLight->GetComponentLocation(), BounceTarget, DeltaTime, 14.f)
+		: BounceTarget;
+	bBouncePlaced = true;
+	BounceLight->SetWorldLocation(BounceLocation);
+}
+
+void UFlashlightComponent::UpdateBrightness(float DeltaTime)
+{
+	if (!bIsOn)
+	{
+		return;
+	}
+
+	float Brightness = 1.f;
+
+	// Switching on: a brief stutter as the contact catches, then a quick rise to full.
+	if (SwitchOnTime >= 0.f)
+	{
+		SwitchOnTime += DeltaTime;
+		if (SwitchOnTime < 0.05f)
+		{
+			Brightness = 0.3f;
+		}
+		else if (SwitchOnTime < 0.09f)
+		{
+			Brightness = 0.05f;
+		}
+		else if (SwitchOnTime < 0.2f)
+		{
+			Brightness = FMath::Lerp(0.6f, 1.f, (SwitchOnTime - 0.09f) / 0.11f);
+		}
+		else
+		{
+			SwitchOnTime = -1.f;
+		}
+	}
+
+	// Weak battery: dimmer and warmer the lower it gets, with stutters that come more often near empty.
+	float Weakness = 0.f;
+	if (BatteryCharge < LowBatteryThreshold)
+	{
+		Weakness = 1.f - BatteryCharge / FMath::Max(0.01f, LowBatteryThreshold);
+		Brightness *= FMath::Lerp(1.f, LowBatteryMinBrightness, Weakness);
+
+		FlickerCooldown -= DeltaTime;
+		if (FlickerRemaining <= 0.f && FlickerCooldown <= 0.f)
+		{
+			FlickerRemaining = FMath::FRandRange(0.2f, 0.55f);
+			FlickerCooldown = FMath::Lerp(7.f, 2.f, Weakness) * FMath::FRandRange(0.7f, 1.3f);
+		}
+		if (FlickerRemaining > 0.f)
+		{
+			FlickerRemaining -= DeltaTime;
+			FlickerStepTimer -= DeltaTime;
+			if (FlickerStepTimer <= 0.f)
+			{
+				FlickerStepTimer = FMath::FRandRange(0.03f, 0.07f);
+				FlickerValue = FMath::FRandRange(0.08f, 1.f);
+			}
+			Brightness *= FlickerValue;
+		}
+	}
+
+	const float Lit = Brightness * ExposureCompensation;
+	SpotLight->SetIntensity(BaseBeamIntensity * Lit);
+	SpillLight->SetIntensity(BaseBeamIntensity * SpillIntensityRatio * Lit);
+	BounceLight->SetIntensity(BounceIntensity * BounceStrength * Lit);
+
+	const float Temperature = BaseBeamTemperature - 900.f * Weakness;
+	SpotLight->SetTemperature(Temperature);
+	SpillLight->SetTemperature(Temperature);
 }
 
 void UFlashlightComponent::TryBindInput()
@@ -443,12 +595,32 @@ void UFlashlightComponent::ToggleFlashlight()
 
 void UFlashlightComponent::SetFlashlightOn(bool bNewOn)
 {
+	const bool bWasOn = bIsOn;
 	bIsOn = bNewOn && bHasFlashlight && BatteryCharge > 0.f;
 	SpotLight->SetVisibility(bIsOn);
+	SpillLight->SetVisibility(bIsOn);
+	BounceLight->SetVisibility(bIsOn);
 	FlashlightMesh->SetVisibility(bHasFlashlight);
 	// Dimmer when off: there's no beam bouncing back onto the flashlight.
 	ViewmodelFill->SetVisibility(bHasFlashlight);
 	ViewmodelFill->SetIntensity(bIsOn ? ViewmodelFillIntensity : ViewmodelFillIntensity * .35f);
+
+	if (bIsOn != bWasOn)
+	{
+		// A switch click, except when the battery simply dies.
+		if (ToggleSound && BatteryCharge > 0.f && GetWorld() && GetWorld()->IsGameWorld())
+		{
+			UGameplayStatics::PlaySound2D(this, ToggleSound, ToggleVolume, FMath::FRandRange(0.96f, 1.04f));
+		}
+		SwitchOnTime = bIsOn ? 0.f : -1.f;
+		// Start aimed where the player is looking, not swinging in from where it was switched off.
+		bBeamPlaced = false;
+		bBouncePlaced = false;
+	}
+	if (bIsOn)
+	{
+		UpdateBrightness(0.f);
+	}
 }
 
 void UFlashlightComponent::GiveFlashlight()

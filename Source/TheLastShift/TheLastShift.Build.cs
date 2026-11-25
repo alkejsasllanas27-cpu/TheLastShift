@@ -14,7 +14,7 @@ public class TheLastShift : ModuleRules
 			"EnhancedInput", "AIModule", "UMG", "Slate", "SlateCore"
 		});
 
-		PrivateDependencyModuleNames.AddRange(new string[] { });
+		PrivateDependencyModuleNames.AddRange(new string[] { "ProceduralMeshComponent" });
 	}
 }
 

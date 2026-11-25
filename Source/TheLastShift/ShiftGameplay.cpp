@@ -31,12 +31,25 @@
 #include "Styling/CoreStyle.h"
 #include "Camera/PlayerCameraManager.h"
 #include "InputCoreTypes.h"
+#include "UObject/ConstructorHelpers.h"
+#include "Engine/StaticMesh.h"
+#include "EnhancedInputComponent.h"
+#include "InputAction.h"
+#include "ShiftRain.h"
+#include "Engine/PostProcessVolume.h"
 
 namespace {
  bool BoolValue(UObject* O,const TCHAR* Name){auto* P=O?FindFProperty<FBoolProperty>(O->GetClass(),Name):nullptr;return P&&P->GetPropertyValue_InContainer(O);}
  void SetBool(UObject* O,const TCHAR* Name,bool V){if(auto* P=O?FindFProperty<FBoolProperty>(O->GetClass(),Name):nullptr)P->SetPropertyValue_InContainer(O,V);}
  AActor* ActorValue(UObject* O,const TCHAR* Name){auto* P=O?FindFProperty<FObjectProperty>(O->GetClass(),Name):nullptr;return P?Cast<AActor>(P->GetObjectPropertyValue_InContainer(O)):nullptr;}
  void Sound(AActor* A,USoundBase* S,float Volume=.45f){if(S)UGameplayStatics::PlaySoundAtLocation(A,S,A->GetActorLocation(),Volume);}
+ double NumberValue(UObject* O,const TCHAR* Name,double Default){if(!O)return Default;if(auto* D=FindFProperty<FDoubleProperty>(O->GetClass(),Name))return D->GetPropertyValue_InContainer(O);if(auto* F=FindFProperty<FFloatProperty>(O->GetClass(),Name))return F->GetPropertyValue_InContainer(O);return Default;}
+ /** The hospital's hinged doors: a Blueprint with bIsOpen and OpenAngle that the director swings itself. */
+ bool IsHingedDoor(AActor* A){return A&&FindFProperty<FBoolProperty>(A->GetClass(),TEXT("bIsOpen"))&&(FindFProperty<FDoubleProperty>(A->GetClass(),TEXT("OpenAngle"))||FindFProperty<FFloatProperty>(A->GetClass(),TEXT("OpenAngle")));}
+ /** Which of the door mesh's own horizontal axes runs across the leaf (the other one is its thickness). */
+ bool LeafWidthAlongX(const FBox& Local){const FVector S=Local.GetSize();return S.X>=S.Y;}
+ /** Middle of one vertical edge of the leaf, in mesh space: the min or max end across its width. */
+ FVector LeafEdge(const FBox& Local,bool bMin){FVector P=Local.GetCenter();if(LeafWidthAlongX(Local))P.X=bMin?Local.Min.X:Local.Max.X;else P.Y=bMin?Local.Min.Y:Local.Max.Y;return P;}
 }
 
 AShiftInteractable::AShiftInteractable()
@@ -195,7 +208,12 @@ void UShiftPromptWidget::ShowDeath()
 void UShiftPromptWidget::SetBatteryVisible(bool Visible){const ESlateVisibility V=Visible?ESlateVisibility::HitTestInvisible:ESlateVisibility::Collapsed;if(BatteryText)BatteryText->SetVisibility(V);if(BatteryBar)BatteryBar->SetVisibility(V);}
 void UShiftPromptWidget::UpdateObjective(const FString& Objective){if(ObjectiveText)ObjectiveText->SetText(FText::FromString(Objective));}
 
-AShiftDirector::AShiftDirector(){PrimaryActorTick.bCanEverTick=true;SetActorHiddenInGame(true);}
+AShiftDirector::AShiftDirector()
+{
+ PrimaryActorTick.bCanEverTick=true;SetActorHiddenInGame(true);
+ static ConstructorHelpers::FObjectFinder<USoundBase> Creak(TEXT("/Game/AbandonedHospitalPart2/Audio/DoorCreak.DoorCreak"));if(Creak.Succeeded())DoorCreakSound=Creak.Object;
+ static ConstructorHelpers::FObjectFinder<USoundBase> Latch(TEXT("/Game/ShiftAssets/Audio/SFX_DoorLatch.SFX_DoorLatch"));if(Latch.Succeeded())DoorLatchSound=Latch.Object;
+}
 bool AShiftDirector::BindPlayer()
 {
  PC=UGameplayStatics::GetPlayerController(this,0);Player=PC?Cast<ACharacter>(PC->GetPawn()):nullptr;
@@ -206,6 +224,12 @@ bool AShiftDirector::BindPlayer()
  StandHalfHeight=Player->GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight();
  StandSpeed=Player->GetCharacterMovement()->MaxWalkSpeed;
  Widget=CreateWidget<UShiftPromptWidget>(PC,UShiftPromptWidget::StaticClass());if(Widget)Widget->AddToViewport(20);
+ // Bounded exposure volumes are the hospital interiors; the unbounded one is the outdoor night.
+ InteriorVolumes.Reset();
+ for(TActorIterator<APostProcessVolume> It(GetWorld());It;++It){if(It->bUnbound)OutdoorVolume=*It;else InteriorVolumes.Add(*It);}
+ // It is raining tonight.
+ for(TActorIterator<AShiftRain> It(GetWorld());It;++It)Rain=*It;
+ if(!Rain)Rain=GetWorld()->SpawnActor<AShiftRain>();
  // The two existing entrance controllers retain their animation graphs.
  for(TActorIterator<AActor> It(GetWorld());It;++It){AActor* A=*It;if(ActorValue(A,TEXT("LeftLeaf"))&&ActorValue(A,TEXT("RightLeaf"))){DoorControllers.Add(ActorValue(A,TEXT("LeftLeaf")),A);DoorControllers.Add(ActorValue(A,TEXT("RightLeaf")),A);}}
  // A narrow query surface lets the camera target barred leaves through their gaps.
@@ -271,6 +295,22 @@ FString AShiftDirector::Prompt()const
 void AShiftDirector::Tick(float Dt)
 {
  Super::Tick(Dt);if(!IsValid(Player)){if(!BindPlayer())return;}
+ // The character Blueprint still carries the asset pack's own E action (IA_Interact -> DoInteract), which calls the
+ // door Blueprint's Interact: an instant turn round the building origin that also flips bIsOpen. On the same key press
+ // the director swings that door too, so the two fought: doors spun, and an opening door said "[E] Open".
+ // Every interaction goes through the director, so that binding is dropped (again if the input component is rebuilt).
+ if(Player->InputComponent&&InteractBindingCleared.Get()!=static_cast<UObject*>(Player->InputComponent.Get())){
+  if(auto* Input=Cast<UEnhancedInputComponent>(Player->InputComponent)){
+   TArray<uint32> Drop;
+   for(const TUniquePtr<FEnhancedInputActionEventBinding>& B:Input->GetActionEventBindings())
+    if(B&&B->GetAction()&&B->GetAction()->GetFName()==TEXT("IA_Interact"))Drop.Add(B->GetHandle());
+   for(const uint32 Handle:Drop)Input->RemoveBindingByHandle(Handle);
+   UE_LOG(LogTemp,Log,TEXT("ShiftDirector: removed %d IA_Interact binding(s) from %s; doors swing only through the director"),Drop.Num(),*Player->GetName());
+  }
+  InteractBindingCleared=Player->InputComponent.Get();
+ }
+ UpdateDoors(Dt);
+ UpdateWeatherAndExposure(Dt);
  if(bDead)return;
  if(!IsValid(Flashlight))Flashlight=Player->FindComponentByClass<UFlashlightComponent>();
  if(PC->WasInputKeyJustPressed(EKeys::P)||(GetWorld()->WorldType!=EWorldType::PIE&&PC->WasInputKeyJustPressed(EKeys::Escape)))ToggleMenu();
@@ -305,7 +345,132 @@ void AShiftDirector::Interact()
   if(Ladder->Interact(Player,PC))ActiveLadder=Ladder;else Notify(Ladder->LastFailureReason.ToString());
   return;
  }
- if(FocusedActor){if(auto* C=DoorControllers.Find(FocusedActor)){SetBool(*C,TEXT("IsOpen"),!BoolValue(*C,TEXT("IsOpen")));return;}if(auto* F=FocusedActor->FindFunction(TEXT("Interact")))FocusedActor->ProcessEvent(F,nullptr);return;}
+ if(FocusedActor){if(auto* C=DoorControllers.Find(FocusedActor)){SetBool(*C,TEXT("IsOpen"),!BoolValue(*C,TEXT("IsOpen")));return;}if(IsHingedDoor(FocusedActor)){SwingDoor(FocusedActor);return;}if(auto* F=FocusedActor->FindFunction(TEXT("Interact")))FocusedActor->ProcessEvent(F,nullptr);return;}
+}
+AShiftDirector::FDoorHinge AShiftDirector::FindHinge(AActor* Door,UStaticMeshComponent* Leaf,float OpenAngle) const
+{
+ FDoorHinge H;H.ClosedLocation=Door->GetActorLocation();H.ClosedRotation=Door->GetActorQuat();H.ClosedLeaf=Leaf->GetComponentTransform();
+ const FBox Local=Leaf->GetStaticMesh()->GetBoundingBox();
+ // Tagged doors know their hinge: the edge away from the handle (or the outer edge of a double door).
+ if(Door->ActorHasTag(TEXT("Hinge.Min"))||Door->ActorHasTag(TEXT("Hinge.Max"))){
+  H.bHingeAtMin=Door->ActorHasTag(TEXT("Hinge.Min"));H.Pivot=H.ClosedLeaf.TransformPosition(LeafEdge(Local,H.bHingeAtMin));return H;
+ }
+ // Untagged (no handle to go by): either vertical edge could be the hinge. Take the one it can actually swing open on:
+ // a leaf turned on the wrong edge runs into the wall beside the frame.
+ int32 BestFree=-1;
+ for(const bool bMin:{true,false}){
+  const FVector Pivot=H.ClosedLeaf.TransformPosition(LeafEdge(Local,bMin));
+  int32 Free=0;for(const float Sign:{1.f,-1.f})if(!DoorPoseBlocked(Door,Leaf,H.ClosedLeaf,Pivot,bMin,Sign*OpenAngle))++Free;
+  if(Free>BestFree){BestFree=Free;H.bHingeAtMin=bMin;H.Pivot=Pivot;}
+ }
+ return H;
+}
+bool AShiftDirector::DoorPoseBlocked(AActor* Door,UStaticMeshComponent* Leaf,const FTransform& ClosedLeaf,const FVector& Pivot,bool bHingeAtMin,float Angle) const
+{
+ const FBox Local=Leaf->GetStaticMesh()->GetBoundingBox();
+ // The outer part of the leaf (from a quarter of the way out), inset from the floor and the lintel.
+ FVector Half=Local.GetExtent();if(LeafWidthAlongX(Local))Half.X*=.35f;else Half.Y*=.35f;Half.Z*=.8f;
+ const FVector LocalCenter=FMath::Lerp(LeafEdge(Local,bHingeAtMin),LeafEdge(Local,!bHingeAtMin),.6f);
+ const FTransform Turned=ClosedLeaf*FTransform(-Pivot)*FTransform(FQuat(FVector::UpVector,FMath::DegreesToRadians(Angle)))*FTransform(Pivot);
+ FCollisionQueryParams Params(SCENE_QUERY_STAT(DoorSwing),true,Door);if(Player)Params.AddIgnoredActor(Player);
+ return GetWorld()->OverlapBlockingTestByChannel(Turned.TransformPosition(LocalCenter),Turned.GetRotation(),ECC_Visibility,FCollisionShape::MakeBox(Half*Turned.GetScale3D().GetAbs()),Params);
+}
+void AShiftDirector::SetDoorAngle(AActor* Door,FDoorHinge& Hinge,float Angle)
+{
+ Hinge.Angle=Angle;const FQuat Turn(FVector::UpVector,FMath::DegreesToRadians(Angle));
+ Door->SetActorLocationAndRotation(Hinge.Pivot+Turn.RotateVector(Hinge.ClosedLocation-Hinge.Pivot),Turn*Hinge.ClosedRotation,false,nullptr,ETeleportType::TeleportPhysics);
+}
+void AShiftDirector::SwingDoor(AActor* Door)
+{
+ if(!IsHingedDoor(Door))return;
+ SwingOne(Door,true);
+ // Double doors open and close together (one creak is enough).
+ AActor* Other=DoorPartner(Door);
+ if(IsHingedDoor(Other)&&BoolValue(Other,TEXT("bIsOpen"))!=BoolValue(Door,TEXT("bIsOpen")))SwingOne(Other,false);
+}
+AActor* AShiftDirector::DoorPartner(AActor* Door) const
+{
+ for(const FName& Tag:Door->Tags){
+  const FString S=Tag.ToString();
+  if(!S.StartsWith(TEXT("DoorPair.")))continue;
+  const FString Name=S.RightChop(9);
+  for(TActorIterator<AActor> It(GetWorld());It;++It)if(It->GetName()==Name)return *It;
+ }
+ return nullptr;
+}
+void AShiftDirector::SwingOne(AActor* Door,bool bPlaySound)
+{
+ auto* Leaf=Door->FindComponentByClass<UStaticMeshComponent>();if(!Leaf||!Leaf->GetStaticMesh())return;
+ // The doors' own Blueprint snaps them round their actor origin in ~0.6 s while their creak lasts ~2.2 s,
+ // so the swing is driven here instead: around the real hinge, eased, timed to the creak.
+ const bool bOpening=!BoolValue(Door,TEXT("bIsOpen"));
+ // Some doors carry a negative OpenAngle (the Blueprint's way of picking a side); the side is chosen below.
+ const float OpenAngle=FMath::Max(1.f,FMath::Abs((float)NumberValue(Door,TEXT("OpenAngle"),90.0)));
+ if(!DoorHinges.Contains(Door))DoorHinges.Add(Door,FindHinge(Door,Leaf,OpenAngle));
+ FDoorHinge& H=DoorHinges[Door];
+ float To=0.f;
+ if(bOpening){
+  if(!FMath::IsNearlyZero(H.Angle))To=FMath::Sign(H.Angle)*OpenAngle; // already part-way open: keep going that way
+  else{
+   // Push it open, away from the player, unless that side is blocked.
+   const FVector Center=H.ClosedLeaf.TransformPosition(Leaf->GetStaticMesh()->GetBoundingBox().GetCenter());
+   auto OpenCenter=[&](float Sign){return H.Pivot+(Center-H.Pivot).RotateAngleAxis(Sign*OpenAngle,FVector::UpVector);};
+   float Sign=1.f;
+   if(Player&&FVector::DistSquared2D(OpenCenter(-1.f),Player->GetActorLocation())>FVector::DistSquared2D(OpenCenter(1.f),Player->GetActorLocation()))Sign=-1.f;
+   if(DoorPoseBlocked(Door,Leaf,H.ClosedLeaf,H.Pivot,H.bHingeAtMin,Sign*OpenAngle)&&!DoorPoseBlocked(Door,Leaf,H.ClosedLeaf,H.Pivot,H.bHingeAtMin,-Sign*OpenAngle))Sign=-Sign;
+   To=Sign*OpenAngle;
+  }
+ }
+ DoorSwings.RemoveAll([Door](const FDoorSwing& S){return S.Door.Get()==Door;});
+ // A little pitch variation so repeated doors don't sound identical; pitching up also shortens the creak.
+ const float Pitch=FMath::FRandRange(.94f,1.06f);
+ FDoorSwing& S=DoorSwings.AddDefaulted_GetRef();
+ S.Door=Door;S.From=H.Angle;S.To=To;S.bClosing=!bOpening;
+ // A door stopped part-way has less to travel; closing is a firmer push than opening.
+ S.Duration=DoorSwingSeconds*(bOpening?1.f:.75f)/Pitch*FMath::Clamp(FMath::Abs(S.To-S.From)/OpenAngle,.3f,1.f);
+ SetBool(Door,TEXT("bIsOpen"),bOpening);
+ // While it moves, the leaf lets the player through instead of shoving them or pinning them in the frame.
+ if(!DoorsIgnoringPawn.Contains(Leaf))DoorsIgnoringPawn.Add(Leaf,Leaf->GetCollisionResponseToChannel(ECC_Pawn));
+ Leaf->SetCollisionResponseToChannel(ECC_Pawn,ECR_Ignore);
+ if(bPlaySound&&DoorCreakSound)UGameplayStatics::PlaySoundAtLocation(this,DoorCreakSound,H.Pivot,DoorVolume,Pitch);
+}
+void AShiftDirector::UpdateDoors(float Dt)
+{
+ for(int32 i=DoorSwings.Num()-1;i>=0;--i){
+  FDoorSwing& S=DoorSwings[i];AActor* Door=S.Door.Get();FDoorHinge* H=Door?DoorHinges.Find(Door):nullptr;
+  if(!Door||!H){DoorSwings.RemoveAtSwap(i);continue;}
+  S.Elapsed+=Dt;const float T=FMath::Clamp(S.Elapsed/S.Duration,0.f,1.f);
+  // A pushed door moves the moment it is pushed and slows to a stop as the creak fades
+  // (easing in as well made it hang still for the first half second, as if stuck).
+  SetDoorAngle(Door,*H,FMath::Lerp(S.From,S.To,1.f-FMath::Pow(1.f-T,2.2f)));
+  if(T>=1.f){if(S.bClosing&&DoorLatchSound)UGameplayStatics::PlaySoundAtLocation(this,DoorLatchSound,H->Pivot,DoorVolume);DoorSwings.RemoveAtSwap(i);}
+ }
+ // A leaf that has stopped blocks the player again, once the player is not standing inside it.
+ for(auto It=DoorsIgnoringPawn.CreateIterator();It;++It){
+  UPrimitiveComponent* Leaf=It.Key().Get();
+  if(!Leaf){It.RemoveCurrent();continue;}
+  AActor* Door=Leaf->GetOwner();
+  if(DoorSwings.ContainsByPredicate([Door](const FDoorSwing& S){return S.Door.Get()==Door;}))continue;
+  if(Player){
+   const UCapsuleComponent* Capsule=Player->GetCapsuleComponent();
+   if(Leaf->OverlapComponent(Capsule->GetComponentLocation(),Capsule->GetComponentQuat(),Capsule->GetCollisionShape(5.f)))continue;
+  }
+  Leaf->SetCollisionResponseToChannel(ECC_Pawn,It.Value());It.RemoveCurrent();
+ }
+}
+void AShiftDirector::UpdateWeatherAndExposure(float Dt)
+{
+ const FVector Cam=PC&&PC->PlayerCameraManager?PC->PlayerCameraManager->GetCameraLocation():Player->GetActorLocation();
+ // A roof within 30 m overhead means indoors or under cover: no falling rain there, only its sound on the roof.
+ FHitResult Roof;FCollisionQueryParams Params(SCENE_QUERY_STAT(ShiftRoof),false,Player);
+ const bool bRoof=GetWorld()->LineTraceSingleByChannel(Roof,Cam,Cam+FVector(0,0,3000),ECC_Visibility,Params);
+ if(IsValid(Rain))Rain->SetViewer(Cam,bRoof);
+ // The interiors run a darker exposure than outside; the flashlight is scaled so its beam looks the same in both.
+ float Reference=FlashlightOutdoorReferenceBias,Bias=FlashlightOutdoorReferenceBias;
+ if(OutdoorVolume.IsValid()&&OutdoorVolume->Settings.bOverride_AutoExposureBias)Bias=OutdoorVolume->Settings.AutoExposureBias;
+ for(const TWeakObjectPtr<APostProcessVolume>& Volume:InteriorVolumes)
+  if(Volume.IsValid()&&Volume->bEnabled&&Volume->Settings.bOverride_AutoExposureBias&&Volume->EncompassesPoint(Cam,0.f,nullptr)){Reference=FlashlightInteriorReferenceBias;Bias=Volume->Settings.AutoExposureBias;break;}
+ if(IsValid(Flashlight))Flashlight->ExposureCompensation=FMath::FInterpTo(Flashlight->ExposureCompensation,FMath::Pow(2.f,Reference-Bias),Dt,4.f);
 }
 void AShiftDirector::Notify(const FString& Text,float Seconds){Status=Text;StatusUntil=GetWorld()->GetTimeSeconds()+Seconds;}
 void AShiftDirector::AddBattery(){SpareBatteries=FMath::Min(3,SpareBatteries+1);Notify(FString::Printf(TEXT("Battery collected  |  Spares: %d  |  R to replace"),SpareBatteries));}
